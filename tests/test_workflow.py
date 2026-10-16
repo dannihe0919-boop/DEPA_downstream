@@ -380,7 +380,25 @@ class IntegrationAndPipelineTests(unittest.TestCase):
             path.write_text('root_dir: /old/mac\nh5ad_path: data/counts.h5ad\noutput_root: outputs\n')
             config = load_analysis_config(path, root_dir=directory, path_overrides={'h5ad_path': '/absolute/counts.h5ad'})
             self.assertEqual(config['h5ad_path'], '/absolute/counts.h5ad')
-            self.assertEqual(config['output_root'], str(Path(directory) / 'outputs'))
+            # macOS /var is a symlink to /private/var. The loader deliberately
+            # returns canonical paths, so the expected path must be resolved.
+            self.assertEqual(config['output_root'], str((Path(directory) / 'outputs').resolve()))
+
+    def test_config_canonicalizes_symlinked_root_and_absolute_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            actual = root / 'actual'
+            actual.mkdir()
+            alias = root / 'alias'
+            alias.symlink_to(actual, target_is_directory=True)
+            (actual / 'config.yaml').write_text('h5ad_path: original.h5ad\noutput_root: outputs\n')
+            config = load_analysis_config(
+                alias / 'config.yaml', root_dir=alias,
+                path_overrides={'h5ad_path': str(alias / 'data' / 'counts.h5ad')},
+            )
+            self.assertEqual(config['root_dir'], str(actual))
+            self.assertEqual(config['output_root'], str(actual / 'outputs'))
+            self.assertEqual(config['h5ad_path'], str(actual / 'data' / 'counts.h5ad'))
 
     def test_infinite_enrichr_scores_do_not_hide_hits_in_plot(self):
         import matplotlib
