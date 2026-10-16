@@ -1,0 +1,266 @@
+cat > depa_downstream/io_layer.py << 'PYEOF_MARKER'
+"""
+读取 cNMF 输出、metadata、feature 注释，统一封装成一个 data 字典。
+
+所有下游 Layer 函数都只接收这个 data 字典（+ config），不直接碰文件路径，
+这样 Layer 函数和"数据从哪读"彻底解耦。
+"""
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import pandas as pd
+from scipy.stats import zscore
+
+from .config_schema import validate_config
+
+
+def _build_cnmf_paths(config: dict) -> dict:
+    """根据 CONFIG 拼出 cNMF 三件套的具体文件路径。"""
+    base = config["cnmf_dir"]
+    name = config["run_name"]
+    K = config["K"]
+    dt = config["density_threshold"]
+    return {
+        "spectra_score": f"{base}/{name}/{name}.gene_spectra_score.k_{K}.dt_{dt}.txt",
+        "spectra_tpm": f"{base}/{name}/{name}.gene_spectra_tpm.k_{K}.dt_{dt}.txt",
+        "usage": f"{base}/{name}/{name}.usages.k_{K}.dt_{dt}.consensus.txt",
+    }
+
+
+def _check_files_exist(paths: dict) -> None:
+    print("检查 cNMF 输入文件...")
+    missing = []
+    for key, p in paths.items():
+        exists = os.path.exists(p)
+        size = f"{os.path.getsize(p) / 1e6:.1f} MB" if exists else "-"
+        status = "OK" if exists else "缺失"
+        print(f"  [{status}] {key}: {p} ({size})")
+        if not exists:
+            missing.append(p)
+    if missing:
+        raise FileNotFoundError(f"以下 cNMF 输出文件不存在，请检查 CONFIG 里的 "
+                                 f"cnmf_dir/run_name/K/density_threshold 是否正确: {missing}")
+
+
+def load_cnmf_outputs(config: dict) -> dict:
+    """读取 cNMF spectra/usage + metadata + feature 注释，返回统一的 data 字典。
+
+    Parameters
+    ----------
+    config : dict
+        完整 CONFIG（会先跑 validate_config 校验）。
+
+    Returns
+    -------
+    dict，包含以下 key：
+        "spectra"       : DataFrame, programs x PACs (原始 spectra_score)
+        "spectra_tpm"   : DataFrame, programs x PACs (原始 spectra_tpm)
+        "spectra_z"     : DataFrame, programs x PACs (对每个 program 行做 Z-score，
+                           即在该 program 内部比较 PAC 之间的相对权重)
+        "usage"         : DataFrame, cells x programs
+        "meta"          : DataFrame, cells x metadata 列（index=cell barcode），
+                           从 h5ad 的 .obs 读取
+        "feature_anno"  : DataFrame, index=PAC id，至少含 gene_id 列
+        "programs"      : list[str]，program 名称（如 ["P01", ..., "P06"]）
+        "wpsi"          : DataFrame or None，gene x cell
+        "psi"           : DataFrame or None，gene x cell
+        "depa_feature_source" : DataFrame or None
+    """
+    validate_config(config)
+    paths = _build_cnmf_paths(config)
+    _check_files_exist(paths)
+
+    # ── 1. spectra / usage ──────────────────────────────────────
+    print("\n读取 cNMF spectra 与 usage...")
+    spectra = pd.read_csv(paths["spectra_score"], sep="\t", index_col=0)
+    spectra_tpm = pd.read_csv(paths["spectra_tpm"], sep="\t", index_col=0)
+    usage = pd.read_csv(paths["usage"], sep="\t", index_col=0)
+
+    # program 命名统一化：不同数据集的 cNMF 输出表头格式不一致
+    # （有的是 "P01".."P18" 字符串，有的是纯数字 1..6），统一转成
+    # 零填充字符串（如 K=6 -> "P01".."P06"，K=120 -> "P001".."P120"），
+    # 保证下游所有函数（尤其是手动指定的 module_def/contrasts 里用到的
+    # program 标签）不用关心这层格式差异。
+    K = config["K"]
+    pad_width = max(2, len(str(K)))
+    def _normalize_program_label(x):
+        s = str(x).strip()
+        # 已经是 "P01" 这种格式就直接保留数字部分重新格式化，
+        # 否则原样当作数字处理
+        digits = "".join(ch for ch in s if ch.isdigit()) or s
+        try:
+            return f"P{int(digits):0{pad_width}d}"
+        except ValueError:
+            return s  # 实在不是数字格式的，原样保留，不强行转换报错
+
+    spectra.index = [_normalize_program_label(p) for p in spectra.index]
+    spectra_tpm.index = [_normalize_program_label(p) for p in spectra_tpm.index]
+    usage.columns = [_normalize_program_label(p) for p in usage.columns]
+
+    programs = list(spectra.index)
+    print(f"  spectra: {spectra.shape}  (programs x PACs)")
+    print(f"  usage:   {usage.shape}  (cells x programs)")
+    print(f"  programs (已统一命名): {programs}")
+
+    # 每个 program（行）内部做 Z-score，用于后续"该 program 里哪些 PAC 权重显著偏高"的判断
+    print("\n计算 spectra 逐 program 的 Z-score...")
+    z_vals = zscore(spectra.values, axis=1, nan_policy="omit")
+    spectra_z = pd.DataFrame(z_vals, index=spectra.index, columns=spectra.columns)
+    print(f"  spectra_z: {spectra_z.shape}")
+
+    # ── 2. metadata（从 h5ad 的 .obs 读）──────────────────────────
+    print("\n读取 metadata (h5ad .obs)...")
+    import anndata as ad
+    adata = ad.read_h5ad(config["h5ad_path"])
+    meta = adata.obs.copy()
+    print(f"  meta: {meta.shape}  (cells x columns)")
+
+    meta_cols = config["meta_columns"]
+    missing_cols = [c for c in meta_cols.values() if c not in meta.columns]
+    if missing_cols:
+        raise KeyError(
+            f"config['meta_columns'] 里指定的列在 h5ad.obs 中找不到: {missing_cols}\n"
+            f"  h5ad.obs 实际列名: {list(meta.columns)}"
+        )
+    for role, col in meta_cols.items():
+        print(f"  {role:10s} -> 列 '{col}'，取值样例: {meta[col].dropna().unique()[:5].tolist()}")
+
+    # contrasts 里用到的列也顺带检查一遍，缺失就提前报错，不要等 Layer2 才炸
+    for ctr in config["contrasts"]:
+        if ctr["column"] not in meta.columns:
+            raise KeyError(f"contrast {ctr['name']!r} 用到的列 {ctr['column']!r} 不在 meta 里，"
+                            f"实际列名: {list(meta.columns)}")
+
+    common_cells = usage.index.intersection(meta.index)
+    print(f"\n  usage 与 meta 共有细胞数: {len(common_cells)} "
+          f"(usage独有 {len(usage.index.difference(meta.index))}, "
+          f"meta独有 {len(meta.index.difference(usage.index))})")
+    if len(common_cells) == 0:
+        raise ValueError("usage 和 meta 的细胞 barcode 没有任何交集，检查两者index格式是否一致"
+                          "（比如是否都带/都不带 '-1' 后缀）")
+
+    # ── 3. feature 注释 ──────────────────────────────────────────
+    print("\n读取 feature 注释...")
+    feature_anno = pd.read_csv(config["feature_anno_path"], index_col=0)
+
+    # gene id 列名在不同数据集里不一致（scAPAflow 输出用的是 'gene'，
+    # 早期 ALL 数据用的是 'gene_id'），两个都找一下，统一改名成 'gene_id'
+    # 方便后续 Layer1/3 里不用管这层差异。
+    GENE_ID_COL_CANDIDATES = ["gene_id", "gene"]
+    gene_col = next((c for c in GENE_ID_COL_CANDIDATES if c in feature_anno.columns), None)
+    if gene_col is None:
+        raise KeyError(f"feature_anno_path 指向的表里找不到基因ID列（尝试过 "
+                        f"{GENE_ID_COL_CANDIDATES}），实际列名: {list(feature_anno.columns)}")
+    if gene_col != "gene_id":
+        print(f"  基因ID列名为 '{gene_col}'，统一重命名为 'gene_id'")
+        feature_anno = feature_anno.rename(columns={gene_col: "gene_id"})
+
+    # 校验 index 是否真的是 PAC id（应该和 spectra 的列名大量重合）；
+    # 如果重合度很低，尝试用 'pac_id' 列重新设为 index 再试一次，
+    # 而不是直接假设 index_col=0 读对了。
+    overlap = len(spectra.columns.intersection(feature_anno.index))
+    overlap_frac = overlap / len(spectra.columns)
+    print(f"  当前 index 与 spectra PAC 的重合度: {overlap}/{len(spectra.columns)} ({overlap_frac:.0%})")
+    if overlap_frac < 0.5 and "pac_id" in feature_anno.columns:
+        print("  重合度过低，尝试改用 'pac_id' 列作为 index...")
+        feature_anno = feature_anno.set_index("pac_id")
+        overlap = len(spectra.columns.intersection(feature_anno.index))
+        overlap_frac = overlap / len(spectra.columns)
+        print(f"  改用 pac_id 后重合度: {overlap}/{len(spectra.columns)} ({overlap_frac:.0%})")
+    if overlap_frac < 0.5:
+        raise ValueError(
+            f"feature_anno 的 index 与 spectra 的 PAC 列名重合度过低 ({overlap_frac:.0%})，"
+            f"可能 feature_anno_path 指向的文件不对，或者需要指定别的列作为 index。\n"
+            f"  spectra PAC 样例: {list(spectra.columns[:3])}\n"
+            f"  feature_anno index 样例: {list(feature_anno.index[:3])}"
+        )
+
+    print(f"  feature_anno: {feature_anno.shape}")
+
+    missing_pacs = spectra.columns.difference(feature_anno.index)
+    if len(missing_pacs) > 0:
+        print(f"  ⚠ spectra 中有 {len(missing_pacs)} 个 PAC 在 feature_anno 里找不到注释"
+              f"（后续分析会自动跳过这些PAC）")
+
+    # ── 4. 可选输入：wPSI / PSI / DEPA_feature_source ────────────
+    wpsi_psi = load_wpsi_psi(config)
+    depa_source = load_depa_feature_source(config)
+
+    print("\n✓ load_cnmf_outputs 完成")
+
+    return {
+        "spectra": spectra,
+        "spectra_tpm": spectra_tpm,
+        "spectra_z": spectra_z,
+        "usage": usage,
+        "meta": meta,
+        "feature_anno": feature_anno,
+        "programs": programs,
+        "wpsi": wpsi_psi["wpsi"],
+        "psi": wpsi_psi["psi"],
+        "depa_feature_source": depa_source,
+    }
+
+
+def load_wpsi_psi(config: dict) -> dict:
+    """按需读取 wPSI / PSI 矩阵（.rds，用 pyreadr）。
+
+    没有配置对应路径、文件不存在、或者读取失败（.rds 格式 pyreadr 解析不了，
+    比如较新 R 版本默认用了 pyreadr 不支持的压缩方式）时对应 key 都设为 None，
+    并打印清楚原因——这是可选输入，读取失败不应该让整个 load_cnmf_outputs()
+    崩溃，调用方（Layer1）会根据 None 自动跳过 wPSI 相关分析。
+    """
+    result = {"wpsi": None, "psi": None}
+    for key, cfg_key in [("wpsi", "wpsi_matrix_path"), ("psi", "psi_matrix_path")]:
+        path = config.get(cfg_key)
+        if not path:
+            print(f"  [io_layer] CONFIG 未配置 {cfg_key}，跳过读取 {key}")
+            continue
+        if not os.path.exists(path):
+            print(f"  [io_layer] {cfg_key} 指向的文件不存在: {path}，跳过读取 {key}")
+            continue
+        import pyreadr
+        print(f"  读取 {key} 矩阵: {path}")
+        try:
+            df = pyreadr.read_r(path)[None]
+        except Exception as e:
+            print(f"  ⚠ 读取 {key} 失败（pyreadr无法解析该.rds文件），跳过，"
+                  f"不影响其余数据: {type(e).__name__}: {e}")
+            print(f"    常见原因：R端 saveRDS() 用了pyreadr不支持的压缩格式(如xz)，"
+                  f"或对象不是普通data.frame。\n"
+                  f"    解决办法二选一：\n"
+                  f"      1) 在R里重存一份: saveRDS(obj, '{path}', compress='gzip')\n"
+                  f"      2) 改用 rpy2 读取（需要本机有R环境）：\n"
+                  f"         pip install rpy2\n"
+                  f"         import rpy2.robjects as robjects\n"
+                  f"         from rpy2.robjects import pandas2ri; pandas2ri.activate()\n"
+                  f"         df = robjects.r['readRDS']('{path}')")
+            continue
+        print(f"    {key} shape: {df.shape}")
+        result[key] = df
+    return result
+
+
+def load_depa_feature_source(config: dict) -> pd.DataFrame | None:
+    """按需读取 DEPA_feature_source.csv（Layer3 的 program->context 反查用）。
+
+    这是可选输入：不是所有数据集在构建 cNMF 输入时都经过
+    scAPAflow::build_depa_feature_object 这一步（比如最早的 ALL 白血病数据
+    就没有），所以缺失时返回 None，不报错。
+    """
+    path = config.get("depa_feature_source_path")
+    if not path:
+        print("  [io_layer] CONFIG 未配置 depa_feature_source_path，跳过（Layer3将退回手动module_def）")
+        return None
+    if not os.path.exists(path):
+        print(f"  [io_layer] depa_feature_source_path 指向的文件不存在: {path}，跳过")
+        return None
+    df = pd.read_csv(path)
+    print(f"  读取 DEPA_feature_source: {df.shape}")
+    return df
+PYEOF_MARKER
+
+echo "io_layer.py 已更新（program命名统一为P01/P02格式）"

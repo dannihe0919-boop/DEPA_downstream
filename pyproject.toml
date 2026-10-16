@@ -1,0 +1,10 @@
+[project]
+name = "depa_downstream"
+version = "0.1"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["depa_downstream"]

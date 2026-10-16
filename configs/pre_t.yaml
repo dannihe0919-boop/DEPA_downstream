@@ -1,0 +1,36 @@
+cnmf_dir: "/Volumes/Elements/data/ALL_Pre-T/cNMF_output"
+run_name: "PreT_DEAPA_programs"
+K: 8
+density_threshold: "0_01"
+
+h5ad_path: "/Volumes/Elements/data/ALL_Pre-T/cNMF_output/PreT_DEAPA_counts.h5ad"
+feature_anno_path: "/Volumes/Elements/data/ALL_Pre-T/cNMF_input/cnmf_feature_anno.csv"
+
+wpsi_matrix_path: "/Volumes/Elements/data/ALL_Pre-T/PSI_results/movAPA_wPSI_matrix_df.rds"
+psi_matrix_path: "/Volumes/Elements/data/ALL_Pre-T/PSI_results/movAPA_PSI_matrix_df.rds"
+depa_feature_source_path: "/Volumes/Elements/data/ALL_Pre-T/cNMF_input/DEPA_feature_source.csv"
+gene_symbol_map_path: "/Volumes/Elements/DEPA_downstream/configs/pre_t_gene_symbol_map.csv"
+
+meta_columns:
+  sample: "sample"
+  celltype: "cell_type_final"
+  umap1: "UMAP_1"
+  umap2: "UMAP_2"
+
+contrasts:
+  - name: "disease"
+    column: "group"
+    type: "pairwise"
+    group_a: "PBMMC"
+    group_b: "PreT_ALL"
+    category: "disease"
+
+  - name: "celltype_identity"
+    column: "cell_type_final"
+    type: "auto_one_vs_rest_all"
+
+z_threshold: 1.5
+background_scope: "pac_universe"
+min_cells_per_group: 20
+enrichr_databases: [GO_Biological_Process_2023, KEGG_2021_Human, MSigDB_Hallmark_2020, Reactome_2022]
+output_root: "/Volumes/Elements/DEPA_downstream/outputs/pre_T/"

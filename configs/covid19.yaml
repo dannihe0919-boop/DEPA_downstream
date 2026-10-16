@@ -1,0 +1,84 @@
+# COVID-19 数据集配置
+# 所有路径均相对于 root_dir，换电脑/换盘只需改这一行
+root_dir: "/Users/hedanni/Desktop/DEPA_downstream"
+
+cnmf_dir: "data/covid_19_data/cnmf_output_identity_state"
+run_name: "COVID_DEAPA_programs"
+K: 6
+density_threshold: "0_01"
+
+h5ad_path: "data/covid_19_data/cnmf_output_identity_state/COVID_DEAPA_1231PAC_counts.h5ad"
+feature_anno_path: "data/covid_19_data/cnmf_input_identity_state/cnmf_feature_anno.csv"
+
+# 可选：没有就不填，对应 Layer1 会自动跳过
+wpsi_matrix_path: "data/covid_19_data/PSI_results/movAPA_wPSI_matrix_df.rds"
+psi_matrix_path: "data/covid_19_data/PSI_results/movAPA_PSI_matrix_df.rds"
+
+# 可选：Layer3 自动推断模块用，来自 scAPAflow::build_depa_feature_object 的输出
+depa_feature_source_path: "data/covid_19_data/cnmf_input_identity_state/DEPA_feature_source.csv"
+gene_symbol_map_path: "configs/covid19_gene_symbol_map.csv"
+
+meta_columns:
+  sample: "sample"
+  celltype: "cell_type"
+  umap1: "UMAP_1"
+  umap2: "UMAP_2"
+
+# 允许任意多条、任意类型的对比，不再限定"疾病vs正常"
+contrasts:
+  - name: "disease"
+    column: "group"
+    type: "pairwise"
+    group_a: "Healthy"
+    group_b: "Severe_COVID"
+    category: "disease"
+  # 14种细胞类型 one-vs-rest，自动展开，不用手动列举
+  - name: "celltype_identity"
+    column: "cell_type"
+    type: "auto_one_vs_rest_all"
+
+  # 状态marker对比，和R端 state_pairs 保持一致
+  - name: "iMono_vs_cMono"
+    column: "cell_type"
+    type: "pairwise"
+    group_a: "cMono"
+    group_b: "iMono"
+  - name: "ncMono_vs_cMono"
+    column: "cell_type"
+    type: "pairwise"
+    group_a: "cMono"
+    group_b: "ncMono"
+  - name: "Plasma_vs_NaiveB"
+    column: "cell_type"
+    type: "pairwise"
+    group_a: "Naive_B"
+    group_b: "Plasma"
+  - name: "MemoryB_vs_NaiveB"
+    column: "cell_type"
+    type: "pairwise"
+    group_a: "Naive_B"
+    group_b: "Memory_B"
+  - name: "cDC1_vs_cDC2"
+    column: "cell_type"
+    type: "pairwise"
+    group_a: "cDC2"
+    group_b: "cDC1"
+  - name: "pDC_vs_cDC2"
+    column: "cell_type"
+    type: "pairwise"
+    group_a: "cDC2"
+    group_b: "pDC"
+
+z_threshold: 1.5
+top_n_pacs: 100
+min_cells_per_group: 20
+min_samples_per_group: 2
+enrichr_databases:
+  - "GO_Biological_Process_2023"
+  - "KEGG_2021_Human"
+  - "MSigDB_Hallmark_2020"
+  - "Reactome_2022"
+enrichr_cutoff_padj: 0.05
+diff_padj_cutoff: 0.05
+
+output_root: "outputs/covid_19/"

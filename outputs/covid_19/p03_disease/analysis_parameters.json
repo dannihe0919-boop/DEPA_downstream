@@ -1,0 +1,22 @@
+{
+  "program": "P03",
+  "unit": "sample",
+  "celltype": "cell_type",
+  "groups": [
+    "Healthy",
+    "Severe_COVID"
+  ],
+  "min_cells": 20,
+  "min_units_per_group": 3,
+  "targets": [
+    "cDC2",
+    "ncMono",
+    "cMono"
+  ],
+  "min_valid_wpsi": 20,
+  "min_valid_fraction": 0.2,
+  "seed": 20260928,
+  "usage_primary": "row-normalized fraction; sample-equal mean",
+  "wpsi_method": "sample mean of available single-cell wPSI; NOT count-pseudobulk",
+  "warning": "Exploratory; confirm independent donors, batch confounding, PAC coverage and wPSI definition"
+}
