@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 
-import numpy as np
 import pandas as pd
 from scipy.stats import zscore
 
@@ -17,14 +16,13 @@ from .config_schema import validate_config
 
 
 def _build_cnmf_paths(config: dict) -> dict:
-    """根据 CONFIG 拼出 cNMF 三件套的具体文件路径。"""
+    """根据 CONFIG 拼出 cNMF 权重与 usage 输出的具体文件路径。"""
     base = config["cnmf_dir"]
     name = config["run_name"]
     K = config["K"]
     dt = config["density_threshold"]
     return {
         "spectra_score": f"{base}/{name}/{name}.gene_spectra_score.k_{K}.dt_{dt}.txt",
-        "spectra_tpm": f"{base}/{name}/{name}.gene_spectra_tpm.k_{K}.dt_{dt}.txt",
         "usage": f"{base}/{name}/{name}.usages.k_{K}.dt_{dt}.consensus.txt",
     }
 
@@ -56,7 +54,6 @@ def load_cnmf_outputs(config: dict) -> dict:
     -------
     dict，包含以下 key：
         "spectra"       : DataFrame, programs x PACs (原始 spectra_score)
-        "spectra_tpm"   : DataFrame, programs x PACs (原始 spectra_tpm)
         "spectra_z"     : DataFrame, programs x PACs (对每个 program 行做 Z-score，
                            即在该 program 内部比较 PAC 之间的相对权重)
         "usage"         : DataFrame, cells x programs
@@ -65,8 +62,6 @@ def load_cnmf_outputs(config: dict) -> dict:
         "feature_anno"  : DataFrame, index=PAC id，至少含 gene_id 列
         "programs"      : list[str]，program 名称（如 ["P01", ..., "P06"]）
         "wpsi"          : DataFrame or None，gene x cell
-        "psi"           : DataFrame or None，gene x cell
-        "depa_feature_source" : DataFrame or None
     """
     validate_config(config)
     paths = _build_cnmf_paths(config)
@@ -75,13 +70,12 @@ def load_cnmf_outputs(config: dict) -> dict:
     # ── 1. spectra / usage ──────────────────────────────────────
     print("\n读取 cNMF spectra 与 usage...")
     spectra = pd.read_csv(paths["spectra_score"], sep="\t", index_col=0)
-    spectra_tpm = pd.read_csv(paths["spectra_tpm"], sep="\t", index_col=0)
     usage = pd.read_csv(paths["usage"], sep="\t", index_col=0)
 
     # program 命名统一化：不同数据集的 cNMF 输出表头格式不一致
     # （有的是 "P01".."P18" 字符串，有的是纯数字 1..6），统一转成
     # 零填充字符串（如 K=6 -> "P01".."P06"，K=120 -> "P001".."P120"），
-    # 保证下游所有函数（尤其是手动指定的 module_def/contrasts 里用到的
+    # 保证下游所有函数（尤其是手动指定的 contrasts 里用到的
     # program 标签）不用关心这层格式差异。
     K = config["K"]
     pad_width = max(2, len(str(K)))
@@ -96,7 +90,6 @@ def load_cnmf_outputs(config: dict) -> dict:
             return s  # 实在不是数字格式的，原样保留，不强行转换报错
 
     spectra.index = [_normalize_program_label(p) for p in spectra.index]
-    spectra_tpm.index = [_normalize_program_label(p) for p in spectra_tpm.index]
     usage.columns = [_normalize_program_label(p) for p in usage.columns]
 
     programs = list(spectra.index)
@@ -113,8 +106,11 @@ def load_cnmf_outputs(config: dict) -> dict:
     # ── 2. metadata（从 h5ad 的 .obs 读）──────────────────────────
     print("\n读取 metadata (h5ad .obs)...")
     import anndata as ad
-    adata = ad.read_h5ad(config["h5ad_path"])
-    meta = adata.obs.copy()
+    adata = ad.read_h5ad(config["h5ad_path"], backed="r")
+    try:
+        meta = adata.obs.copy()
+    finally:
+        adata.file.close()
     print(f"  meta: {meta.shape}  (cells x columns)")
 
     meta_cols = config["meta_columns"]
@@ -147,7 +143,7 @@ def load_cnmf_outputs(config: dict) -> dict:
 
     # gene id 列名在不同数据集里不一致（scAPAflow 输出用的是 'gene'，
     # 早期 ALL 数据用的是 'gene_id'），两个都找一下，统一改名成 'gene_id'
-    # 方便后续 Layer1/3 里不用管这层差异。
+    # 方便后续 Layer0–3 里不用管这层差异。
     GENE_ID_COL_CANDIDATES = ["gene_id", "gene"]
     gene_col = next((c for c in GENE_ID_COL_CANDIDATES if c in feature_anno.columns), None)
     if gene_col is None:
@@ -184,38 +180,10 @@ def load_cnmf_outputs(config: dict) -> dict:
         print(f"  ⚠ spectra 中有 {len(missing_pacs)} 个 PAC 在 feature_anno 里找不到注释"
               f"（后续分析会自动跳过这些PAC）")
 
-    # ── 4. 可选输入：wPSI / PSI / DEPA_feature_source / gene symbol映射 ─
-    wpsi_psi = load_wpsi_psi(config)
-
-    # wPSI/PSI矩阵是movAPA(R端)独立跑出来的，barcode格式可能和h5ad(Python端)
-    # 的meta.index不完全一致——常见情况是meta带'-1'这类10x lane后缀而wpsi没有
-    # （或反过来）。先尝试直接交集；如果重合度很低，再尝试剥离meta的'-数字'
-    # 后缀重新匹配，匹配上的话把wpsi列名换成meta的原始barcode格式（不改meta
-    # 本身，因为meta.index还要用来和usage对齐）。
-    for key in ("wpsi", "psi"):
-        mat = wpsi_psi.get(key)
-        if mat is None:
-            continue
-
-        common_direct = mat.columns.intersection(meta.index)
-        if len(common_direct) >= 0.5 * mat.shape[1]:
-            aligned_mat = mat[common_direct]
-        else:
-            stripped_meta_index = meta.index.str.replace(r"-\d+$", "", regex=True)
-            strip_to_orig = dict(zip(stripped_meta_index, meta.index))
-            matched_cols = [c for c in mat.columns if c in strip_to_orig]
-            print(f"  [io_layer] {key} 列名与meta直接匹配率过低"
-                  f"({len(common_direct)}/{mat.shape[1]})，尝试剥离meta barcode的"
-                  f"'-数字'后缀后重新匹配: {len(matched_cols)}/{mat.shape[1]} 匹配成功")
-            aligned_mat = mat[matched_cols].copy()
-            aligned_mat.columns = [strip_to_orig[c] for c in matched_cols]
-
-        n_dropped = mat.shape[1] - aligned_mat.shape[1]
-        print(f"  [io_layer] {key} 与 meta 细胞对齐: 保留 {aligned_mat.shape[1]}/{mat.shape[1]} 个细胞"
-              f"（{n_dropped} 个 {key} 矩阵里的细胞在meta中找不到对应，已剔除）")
-        wpsi_psi[key] = aligned_mat
-
-    depa_source = load_depa_feature_source(config)
+    # Optional wPSI is used by Layer0 QC and Layer3; symbols by Layer0/1.
+    wpsi = load_wpsi(config)
+    if wpsi is not None:
+        wpsi = _align_wpsi_cells(wpsi, meta.index)
     gene_symbol_map = load_gene_symbol_map(config)
 
 
@@ -223,70 +191,71 @@ def load_cnmf_outputs(config: dict) -> dict:
 
     return {
         "spectra": spectra,
-        "spectra_tpm": spectra_tpm,
         "spectra_z": spectra_z,
         "usage": usage,
         "meta": meta,
         "feature_anno": feature_anno,
         "programs": programs,
-        "wpsi": wpsi_psi["wpsi"],
-        "psi": wpsi_psi["psi"],
-        "depa_feature_source": depa_source,
+        "wpsi": wpsi,
         "gene_symbol_map": gene_symbol_map,
     }
 
 
-def load_wpsi_psi(config: dict) -> dict:
-    """按需读取 wPSI / PSI 矩阵（.rds，用 pyreadr）。
+def load_wpsi(config: dict) -> pd.DataFrame | None:
+    """Read an optional gene×cell wPSI RDS; report unavailable inputs explicitly."""
+    path = config.get('wpsi_matrix_path')
+    if not path:
+        print('  [io_layer] 未配置 wpsi_matrix_path，跳过 wPSI；Layer3 将标注缺少输入')
+        return None
+    if not os.path.isfile(path):
+        print(f'  [io_layer] wPSI 文件不存在: {path}，跳过 wPSI')
+        return None
+    import pyreadr
+    try:
+        matrix = pyreadr.read_r(path)[None]
+    except (pyreadr.PyreadrError, pyreadr.LibrdataError, KeyError, ValueError) as error:
+        print(f'  [io_layer] 无法解析 wPSI RDS: {type(error).__name__}: {error}')
+        print('  请确认对象为带基因行名和细胞列名的 data.frame；可在 R 中另存 gzip RDS。')
+        return None
+    if not isinstance(matrix, pd.DataFrame):
+        raise ValueError('wPSI RDS must contain a gene-by-cell data.frame')
+    if not matrix.index.is_unique or not matrix.columns.is_unique:
+        raise ValueError('wPSI gene and cell labels must be unique')
+    print(f'  读取 wPSI: {matrix.shape} (genes × cells)')
+    return matrix
 
-    没有配置对应路径、文件不存在、或者读取失败（.rds 格式 pyreadr 解析不了，
-    比如较新 R 版本默认用了 pyreadr 不支持的压缩方式）时对应 key 都设为 None，
-    并打印清楚原因——这是可选输入，读取失败不应该让整个 load_cnmf_outputs()
-    崩溃，调用方（Layer1）会根据 None 自动跳过 wPSI 相关分析。
-    """
-    result = {"wpsi": None, "psi": None}
-    for key, cfg_key in [("wpsi", "wpsi_matrix_path"), ("psi", "psi_matrix_path")]:
-        path = config.get(cfg_key)
-        if not path:
-            print(f"  [io_layer] CONFIG 未配置 {cfg_key}，跳过读取 {key}")
-            continue
-        if not os.path.exists(path):
-            print(f"  [io_layer] {cfg_key} 指向的文件不存在: {path}，跳过读取 {key}")
-            continue
-        import pyreadr
-        print(f"  读取 {key} 矩阵: {path}")
-        try:
-            df = pyreadr.read_r(path)[None]
-        except Exception as e:
-            print(f"  ⚠ 读取 {key} 失败（pyreadr无法解析该.rds文件），跳过，"
-                  f"不影响其余数据: {type(e).__name__}: {e}")
-            print(f"    常见原因：R端 saveRDS() 用了pyreadr不支持的压缩格式(如xz)，"
-                  f"或对象不是普通data.frame。\n"
-                  f"    解决办法二选一：\n"
-                  f"      1) 在R里重存一份: saveRDS(obj, '{path}', compress='gzip')\n"
-                  f"      2) 改用 rpy2 读取（需要本机有R环境）：\n"
-                  f"         pip install rpy2\n"
-                  f"         import rpy2.robjects as robjects\n"
-                  f"         from rpy2.robjects import pandas2ri; pandas2ri.activate()\n"
-                  f"         df = robjects.r['readRDS']('{path}')")
-            continue
-        print(f"    {key} shape: {df.shape}")
-        result[key] = df
-    return result
+
+def _align_wpsi_cells(wpsi: pd.DataFrame, meta_index: pd.Index) -> pd.DataFrame:
+    """Keep matching cells, with an unambiguous 10x lane-suffix fallback."""
+    direct = wpsi.columns.intersection(meta_index)
+    if len(direct) >= 0.5 * wpsi.shape[1]:
+        aligned = wpsi.loc[:, direct]
+    else:
+        stripped = meta_index.str.replace(r'-\d+$', '', regex=True)
+        mapping = pd.Series(meta_index, index=stripped)
+        if not mapping.index.is_unique:
+            raise ValueError('Stripping metadata barcode suffixes creates ambiguous cell IDs')
+        matched = wpsi.columns.intersection(mapping.index)
+        aligned = wpsi.loc[:, matched].copy()
+        aligned.columns = mapping.loc[matched].to_numpy()
+    print(f'  wPSI 与 metadata 对齐: {aligned.shape[1]}/{wpsi.shape[1]} 个细胞')
+    if aligned.shape[1] == 0:
+        raise ValueError('wPSI and metadata have no matching cell barcodes')
+    return aligned
 
 
 def load_gene_symbol_map(config: dict) -> pd.Series | None:
-    """按需读取 gene_id -> symbol 映射表（Layer3 富集分析用，Enrichr等
+    """按需读取 gene_id -> symbol 映射表（Layer1 富集分析用，Enrichr等
     功能富集工具通常需要基因symbol而不是ENSG这类ID）。
 
     期望的表格式：两列，第一列gene_id，第二列symbol（列名不强制，取前两列）。
-    没配置路径或文件不存在时返回 None，调用方（Layer3）遇到 None 时直接
+    没配置路径或文件不存在时返回 None，调用方（Layer0）遇到 None 时直接
     用 gene_id 本身当作 symbol 使用，不阻塞流程——不是所有数据集的
     gene_id 都需要额外转换（有些movAPA注释里 gene_id 本身就是symbol）。
     """
     path = config.get("gene_symbol_map_path")
     if not path:
-        print("  [io_layer] CONFIG 未配置 gene_symbol_map_path，Layer3将直接用gene_id当symbol使用")
+        print("  [io_layer] CONFIG 未配置 gene_symbol_map_path，Layer0 将保留 gene_id；Layer1 会报告无法映射的 ENSG")
         return None
     if not os.path.exists(path):
         print(f"  [io_layer] gene_symbol_map_path 指向的文件不存在: {path}，跳过")
@@ -300,22 +269,3 @@ def load_gene_symbol_map(config: dict) -> pd.Series | None:
               f"保留首次出现的映射")
     print(f"  读取 gene symbol 映射: {len(mapping)} 条")
     return mapping
-
-
-def load_depa_feature_source(config: dict) -> pd.DataFrame | None:
-    """按需读取 DEPA_feature_source.csv（Layer3 的 program->context 反查用）。
-
-    这是可选输入：不是所有数据集在构建 cNMF 输入时都经过
-    scAPAflow::build_depa_feature_object 这一步（比如最早的 ALL 白血病数据
-    就没有），所以缺失时返回 None，不报错。
-    """
-    path = config.get("depa_feature_source_path")
-    if not path:
-        print("  [io_layer] CONFIG 未配置 depa_feature_source_path，跳过（Layer3将退回手动module_def）")
-        return None
-    if not os.path.exists(path):
-        print(f"  [io_layer] depa_feature_source_path 指向的文件不存在: {path}，跳过")
-        return None
-    df = pd.read_csv(path)
-    print(f"  读取 DEPA_feature_source: {df.shape}")
-    return df

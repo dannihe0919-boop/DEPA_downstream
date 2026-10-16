@@ -7,7 +7,13 @@ import pandas as pd
 import requests
 
 from .layer0_identity import pac_universe
-from .layer3_markers import DEFAULT_ENRICHR_DATABASES
+
+DEFAULT_ENRICHR_DATABASES = [
+    'GO_Biological_Process_2023',
+    'KEGG_2021_Human',
+    'MSigDB_Hallmark_2020',
+    'Reactome_2022',
+]
 
 SPEEDRICHR_URL = 'https://maayanlab.cloud/speedrichr/api'
 ENRICHMENT_COLUMNS = ['database', 'rank', 'term', 'pvalue', 'zscore', 'combined_score', 'genes', 'padj']

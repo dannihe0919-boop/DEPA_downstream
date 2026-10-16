@@ -1,5 +1,4 @@
 """Statistical regression and pipeline checks, using no patient data or network."""
-import copy
 import json
 from pathlib import Path
 import tempfile
@@ -20,6 +19,7 @@ from depa_downstream import (
 from depa_downstream.layer1_enrichment import BackgroundEnrichrClient
 from depa_downstream.layer2_association import _build_label
 from depa_downstream.pipeline import load_analysis_config, main, run_analysis
+from depa_downstream.io_layer import _align_wpsi_cells, load_wpsi
 
 
 def fixture():
@@ -95,6 +95,43 @@ class FakeEnrichr:
             hits = self.queries[payload['userListId']][:3]
             return FakeResponse({payload['backgroundType']: [[1, 'Synthetic pathway', .001, 2, 12, hits, .004]]})
         raise AssertionError(url)
+
+
+class InputTests(unittest.TestCase):
+    def test_wpsi_rds_numeric_roundtrip(self):
+        import pyreadr
+        matrix = pd.DataFrame([[.1, .2], [.8, .9]], columns=['A', 'B'])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'wpsi.rds'
+            pyreadr.write_rds(str(path), matrix, compress='gzip')
+            result = load_wpsi({'wpsi_matrix_path': str(path)})
+        np.testing.assert_allclose(result.to_numpy(), matrix.to_numpy())
+        self.assertEqual(list(result.columns), ['A', 'B'])
+
+    def test_invalid_optional_wpsi_is_reported_without_blocking_other_layers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'invalid.rds'
+            path.write_bytes(b'not an RDS object')
+            self.assertIsNone(load_wpsi({'wpsi_matrix_path': str(path)}))
+
+    def test_direct_barcode_alignment_keeps_matching_cells(self):
+        matrix = pd.DataFrame([[.1, .2, .3]], index=['G'], columns=['A', 'B', 'other'])
+        result = _align_wpsi_cells(matrix, pd.Index(['B', 'A']))
+        self.assertEqual(list(result.columns), ['A', 'B'])
+        np.testing.assert_allclose(result.to_numpy(), [[.1, .2]])
+
+    def test_lane_suffix_fallback_preserves_metadata_barcodes(self):
+        matrix = pd.DataFrame([[.1, .2]], index=['G'], columns=['A', 'B'])
+        result = _align_wpsi_cells(matrix, pd.Index(['A-1', 'B-1']))
+        self.assertEqual(list(result.columns), ['A-1', 'B-1'])
+        np.testing.assert_allclose(result.to_numpy(), matrix.to_numpy())
+
+    def test_ambiguous_or_unmatched_barcode_mapping_is_rejected(self):
+        matrix = pd.DataFrame([[.1]], index=['G'], columns=['A'])
+        with self.assertRaisesRegex(ValueError, 'ambiguous'):
+            _align_wpsi_cells(matrix, pd.Index(['A-1', 'A-2']))
+        with self.assertRaisesRegex(ValueError, 'no matching'):
+            _align_wpsi_cells(matrix, pd.Index(['B-1']))
 
 
 class IdentityTests(unittest.TestCase):
@@ -424,8 +461,8 @@ class IntegrationAndPipelineTests(unittest.TestCase):
             root = Path(directory)
             run = root / 'cnmf' / 'test'
             run.mkdir(parents=True)
-            for kind in ('gene_spectra_score', 'gene_spectra_tpm'):
-                self.data['spectra'].to_csv(run / f'test.{kind}.k_2.dt_0_01.txt', sep='\t')
+            # The final workflow needs weights and usage, not the unused TPM file.
+            self.data['spectra'].to_csv(run / 'test.gene_spectra_score.k_2.dt_0_01.txt', sep='\t')
             self.data['usage'].to_csv(run / 'test.usages.k_2.dt_0_01.consensus.txt', sep='\t')
             ad.AnnData(X=np.zeros((160, 20)), obs=self.data['meta'], var=self.data['feature_anno']).write_h5ad(root / 'counts.h5ad')
             self.data['feature_anno'].to_csv(root / 'features.csv')

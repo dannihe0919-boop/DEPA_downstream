@@ -4,7 +4,7 @@ CONFIG 字段校验。
 设计原则：
   - 必需字段缺失 -> 立即报错，报清楚缺了哪个字段，不要让后面的函数
     因为 KeyError 报出一个莫名其妙的位置。
-  - 可选字段（比如 wpsi_matrix_path / depa_feature_source_path）允许缺失，
+  - 可选字段（比如 wpsi_matrix_path / gene_symbol_map_path）允许缺失，
     对应的 Layer 函数内部自己判断要不要跳过。
 """
 
@@ -40,12 +40,8 @@ VALID_CONTRAST_TYPES = ["pairwise", "one_vs_rest", "auto_one_vs_rest_all"]
 
 # 可选字段一览（不校验存在性，只在这里留文档，方便回头查）：
 #   wpsi_matrix_path          — Layer 0 可靠性标注 / Layer 3 方向检验；不影响富集和 usage
-#   psi_matrix_path           — 同上
-#   depa_feature_source_path  — Layer 3 的 infer_program_modules 用，
-#                                没有则退回手动 MODULE_DEF
-#   module_def                — dict，手动指定的功能模块划分（可选，
-#                                优先级低于 depa_feature_source_path 自动推断）
-#   z_threshold / top_n_pacs / min_cells_per_group / ... — 各层分析阈值，
+#   gene_symbol_map_path      — Layer0 的 gene_id -> symbol 标注，供 Layer1 使用
+#   z_threshold / min_cells_per_group / ... — 各层分析阈值，
 #                                缺失时每个函数使用自己的默认值
 #   spec_min_z / min_detection_rate — Layer 0 专属性和 wPSI 可靠性标注阈值
 #   disease_contrast          — 多个疾病 pairwise 对比时显式指定 Layer 3 使用的 name

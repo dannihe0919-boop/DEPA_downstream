@@ -6,3 +6,6 @@ data/
 .DS_Store
 .ipynb_checkpoints/
 analysis_results/
+__pycache__/
+*.py[cod]
+.venv/

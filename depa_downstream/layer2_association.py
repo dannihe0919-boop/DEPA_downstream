@@ -1,8 +1,7 @@
 """
 Layer 2 — 疾病/条件差异分析：program usage 与任意 contrast 的关联度。
 
-对应原 notebook 的 Cell 3，但原版写死了"疾病 AUC"一个二分类。
-这里改成对 config["contrasts"] 里的每一条独立跑一遍，函数本身不关心
+对 config["contrasts"] 里的每一条独立计算，函数本身不关心
 某条 contrast 在语义上是"疾病 vs 健康"还是"细胞身份 vs 其余"——
 全部当成"某一列的某种分组方式"来处理，保证跨数据集复用。
 
@@ -25,8 +24,6 @@ pairwise -> "state"。auto展开出的子条目会继承父条目的 category。
 
 from __future__ import annotations
 
-import os
-
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
@@ -46,15 +43,6 @@ DEFAULT_CATEGORY_BY_TYPE = {
     "auto_one_vs_rest_all": "identity",
     "pairwise": "state",
 }
-
-# 画图时类别的展示顺序 + 配色，不在这里列出的类别会被追加到末尾并自动分配颜色
-CATEGORY_ORDER = ["disease", "identity", "state"]
-CATEGORY_COLORS = {
-    "disease": "#C44E52",
-    "identity": "#4C72B0",
-    "state": "#55A868",
-}
-
 
 def _resolve_category(ctr: dict) -> str:
     return ctr.get("category") or DEFAULT_CATEGORY_BY_TYPE.get(ctr["type"], "other")
@@ -114,7 +102,6 @@ def _build_label(meta: pd.DataFrame, contrast: dict) -> pd.Series:
 def compute_contrast_association(
     data: dict,
     config: dict,
-    program_direction: pd.DataFrame | None = None,
 ) -> dict:
     """对 config["contrasts"] 里每一条（含自动展开的），计算各 program usage 与该分组的关联度。
 
@@ -124,16 +111,11 @@ def compute_contrast_association(
         需要 data["usage"] (cells x programs) 和 data["meta"]。
     config : dict
         用到 config["contrasts"]，以及可选的 min_cells_per_group（默认20）。
-    program_direction : DataFrame, optional
-        Layer1 的输出，目前仅在结果里附带一列 direction 方便一起看，
-        不参与关联度计算本身。可以为 None。
-
     Returns
     -------
     dict，key 是每条（展开后的）contrast 的 "name"，value 是一个 DataFrame：
         index=program，列：auc, lr_coef（逻辑回归系数，标准化后）,
         dt_importance（决策树特征重要性）, xgb_importance（若xgboost可用）,
-        direction（若提供了program_direction）,
         n_group_a, n_group_b（各组细胞数）
         每个 DataFrame 附带 .attrs["category"]（该contrast的类别标签，
         画热图分组用）。
@@ -234,8 +216,6 @@ def compute_contrast_association(
                 "n_group_a": n_a,
                 "n_group_b": n_b,
             }
-            if program_direction is not None and prog in program_direction.index:
-                row["direction"] = program_direction.loc[prog, "direction"]
             rows.append(row)
 
         result_df = pd.DataFrame(rows).set_index("program")
@@ -303,250 +283,3 @@ def summarize_program_associations(assoc_results: dict, config: dict,
                        association_status='ok')
         rows.append(row)
     return pd.DataFrame(rows).set_index('program')
-
-
-def plot_association_heatmap(assoc_results: dict, config: dict, out_dir: str) -> str:
-    """画所有 contrast x program 的 AUC 汇总热图，按 category 分组展示。
-
-    列先按 category（disease -> identity -> state -> 其他，未知类别追加在
-    最后）分组，组内按名字排序；组间画分隔线；顶部加一条颜色条标注每列
-    属于哪个 category，并附图例。
-    """
-    valid = {k: v for k, v in assoc_results.items() if v is not None}
-    if not valid:
-        print("  [Layer2] 没有任何 contrast 有有效结果，跳过画图")
-        return ""
-
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import ListedColormap
-    from matplotlib.patches import Patch
-
-    os.makedirs(out_dir, exist_ok=True)
-    programs = sorted(next(iter(valid.values())).index.tolist())
-
-    # 按 category 分组排序列
-    cat_of = {name: df.attrs.get("category", "other") for name, df in valid.items()}
-    all_cats = list(dict.fromkeys(CATEGORY_ORDER + sorted(set(cat_of.values()) - set(CATEGORY_ORDER))))
-    ordered_names = sorted(valid.keys(), key=lambda n: (all_cats.index(cat_of[n]), n))
-
-    mat = pd.DataFrame({name: valid[name]["auc"] for name in ordered_names}).reindex(programs)
-    col_categories = [cat_of[name] for name in ordered_names]
-
-    # 给每个出现过的 category 分配颜色（预设的用预设色，其余自动分配）
-    cmap_fallback = plt.get_cmap("Set2")
-    color_lookup = dict(CATEGORY_COLORS)
-    for i, c in enumerate(all_cats):
-        if c not in color_lookup:
-            color_lookup[c] = cmap_fallback(i % 8)
-
-    n_cols = len(ordered_names)
-    fig, (strip_ax, ax) = plt.subplots(
-        2, 1, figsize=(max(5, 0.55 * n_cols), max(3, 0.5 * len(programs)) + 0.6),
-        gridspec_kw={"height_ratios": [0.4, max(3, 0.5 * len(programs))], "hspace": 0.05},
-        sharex=True,
-    )
-
-    # ── 顶部 category 颜色条 ──
-    cat_codes = [all_cats.index(c) for c in col_categories]
-    used_cats = [c for c in all_cats if c in set(col_categories)]
-    strip_cmap = ListedColormap([color_lookup[c] for c in used_cats])
-    code_remap = {all_cats.index(c): i for i, c in enumerate(used_cats)}
-    strip_vals = np.array([[code_remap[code] for code in cat_codes]])
-    strip_ax.imshow(strip_vals, aspect="auto", cmap=strip_cmap,
-                     vmin=-0.5, vmax=len(used_cats) - 0.5)
-    strip_ax.set_yticks([])
-    strip_ax.set_xticks([])
-    for spine in strip_ax.spines.values():
-        spine.set_visible(False)
-    legend_handles = [Patch(facecolor=color_lookup[c], label=c) for c in used_cats]
-    strip_ax.legend(handles=legend_handles, loc="lower left", bbox_to_anchor=(0, 1.05),
-                     ncol=len(used_cats), fontsize=8, frameon=False)
-
-    # ── 主热图 ──
-    im = ax.imshow(mat.values, cmap="RdBu_r", vmin=0, vmax=1, aspect="auto")
-    ax.set_xticks(range(n_cols))
-    ax.set_xticklabels(mat.columns, rotation=45, ha="right", fontsize=8)
-    ax.set_yticks(range(len(programs)))
-    ax.set_yticklabels(programs)
-    for i in range(mat.shape[0]):
-        for j in range(mat.shape[1]):
-            val = mat.values[i, j]
-            if pd.notna(val):
-                ax.text(j, i, f"{val:.2f}", ha="center", va="center",
-                         color="white" if abs(val - 0.5) > 0.25 else "black", fontsize=7)
-
-    # 组间分隔线
-    boundaries = []
-    for i in range(1, n_cols):
-        if col_categories[i] != col_categories[i - 1]:
-            boundaries.append(i - 0.5)
-    for b in boundaries:
-        ax.axvline(b, color="black", linewidth=1.2)
-
-    fig.suptitle("Program usage ~ contrast association (AUC)", y=0.98)
-    fig.subplots_adjust(left=0.12, right=0.88, bottom=0.32, top=0.88)
-    fig.colorbar(im, ax=[strip_ax, ax], label="AUC (0.5 = no association)", fraction=0.025, pad=0.02)
-
-    out_path = os.path.join(out_dir, "layer2_association_heatmap.png")
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"  已保存: {out_path}")
-    return out_path
-
-
-def plot_program_umap_grid(data: dict, config: dict, out_dir: str) -> str:
-    """全 program 的 UMAP 网格图（每个 program 一张小图，按 usage 染色）。
-
-    第一张图固定是 cell_type 分类着色（若 config['meta_columns'] 里配置了
-    celltype列），作为参照，方便直接对照某个program的高usage区域落在哪个
-    细胞类型上。每个类型簇的中心位置直接标注类型名文字（白色描边保证在
-    深色点上也清晰可读），不需要额外看图例对照颜色。
-
-    需要 config["meta_columns"] 里配置了 umap1/umap2，没配置则跳过并提示。
-    """
-    meta_cols = config["meta_columns"]
-    if "umap1" not in meta_cols or "umap2" not in meta_cols:
-        print("  [Layer2] 未配置 UMAP 坐标列，跳过 UMAP 网格图")
-        return ""
-
-    import matplotlib.pyplot as plt
-    import matplotlib.patheffects as pe
-
-    os.makedirs(out_dir, exist_ok=True)
-    usage = data["usage"]
-    meta = data["meta"]
-    programs = data["programs"]
-    common_idx = usage.index.intersection(meta.index)
-
-    x = meta.loc[common_idx, meta_cols["umap1"]].values
-    y = meta.loc[common_idx, meta_cols["umap2"]].values
-
-    celltype_col = meta_cols.get("celltype")
-    has_celltype = celltype_col is not None and celltype_col in meta.columns
-
-    panels = (["__celltype__"] if has_celltype else []) + list(programs)
-    n = len(panels)
-    ncols = min(3, n)
-    nrows = int(np.ceil(n / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows), squeeze=False)
-
-    for idx, panel in enumerate(panels):
-        ax = axes[idx // ncols][idx % ncols]
-        if panel == "__celltype__":
-            cats = meta.loc[common_idx, celltype_col].astype(str)
-            uniq = sorted(cats.unique())
-            cmap = plt.get_cmap("tab20", max(len(uniq), 1))
-            color_map = {c: cmap(i) for i, c in enumerate(uniq)}
-            point_colors = cats.map(color_map).tolist()
-            ax.scatter(x, y, c=point_colors, s=3, linewidths=0)
-            ax.set_title("cell_type (reference)")
-            # 每个类型簇中心直接标文字，不用图例
-            for c in uniq:
-                mask = cats.values == c
-                xm, ym = np.median(x[mask]), np.median(y[mask])
-                ax.text(xm, ym, c, fontsize=8, fontweight="bold", ha="center", va="center",
-                         path_effects=[pe.withStroke(linewidth=2.5, foreground="white")])
-        else:
-            c = usage.loc[common_idx, panel].values
-            sc = ax.scatter(x, y, c=c, cmap="viridis", s=3, linewidths=0)
-            ax.set_title(panel)
-            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-    for idx in range(n, nrows * ncols):
-        axes[idx // ncols][idx % ncols].axis("off")
-
-    fig.suptitle("Program usage on UMAP")
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-
-    out_path = os.path.join(out_dir, "layer2_program_umap_grid.png")
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"  已保存: {out_path}")
-    return out_path
-
-
-
-# ────────────────────────────────────────────────────────────────
-# 把program-contrast关联下钻到具体基因：gene x celltype wPSI
-# ────────────────────────────────────────────────────────────────
-
-def compute_gene_celltype_wpsi(
-    data: dict,
-    config: dict,
-    leading_genes: dict,
-    groupby_col: str | None = None,
-    min_cells: int = 10,
-):
-    """把所有program的leading genes合并，计算每个基因在每个细胞类型(或其它
-    meta分组)里的wPSI均值，用来把compute_contrast_association()给出的
-    program-contrast关联强度下钻到"具体是哪些基因、在哪些细胞类型里的差异"。
-
-    用mean而不是median聚合，呼应layer1_direction里
-    _compare_gene_within_celltype_effect_size 的做法：单细胞wPSI零膨胀严重，
-    中位数容易被钉死在0/1边界，均值更能反映组间的真实差异。
-
-    Parameters
-    ----------
-    leading_genes : dict
-        layer1_direction.compute_leading_genes() 的返回值。
-    groupby_col : str, optional
-        meta里的分组列名，默认取 config["meta_columns"]["celltype"]；
-        传疾病分组那一列可以看program在疾病状态间的基因级差异。
-    min_cells : int
-        分组细胞数低于这个阈值的组跳过，避免小样本均值不稳。
-
-    Returns
-    -------
-    (wpsi_matrix, gene_program_map, gene_symbol_map) 或 None
-        wpsi_matrix: DataFrame index=gene_id, columns=分组取值
-        gene_program_map: Series index=gene_id, value=所属program
-        gene_symbol_map: Series index=gene_id, value=symbol
-    """
-    wpsi = data.get("wpsi")
-    if wpsi is None:
-        print("  [Layer2] 未提供 wPSI 矩阵，跳过 gene x celltype 计算")
-        return None
-
-    meta = data["meta"]
-    if groupby_col is None:
-        groupby_col = config["meta_columns"]["celltype"]
-
-    gene_program_map, id_to_symbol = {}, {}
-    for p, df in leading_genes.items():
-        if df is None or len(df) == 0:
-            continue
-        for _, row in df.iterrows():
-            gene_program_map.setdefault(row["gene_id"], p)
-            id_to_symbol.setdefault(row["gene_id"], row["symbol"])
-
-    if not gene_program_map:
-        print("  [Layer2] 所有program都没有leading genes，跳过")
-        return None
-
-    gene_ids = pd.Index(gene_program_map.keys()).intersection(wpsi.index)
-    n_missing = len(gene_program_map) - len(gene_ids)
-    if n_missing:
-        print(f"  [Layer2] {n_missing} 个leading gene不在wPSI矩阵里，已跳过")
-
-    group_sizes = meta[groupby_col].value_counts()
-    valid_groups = group_sizes[group_sizes >= min_cells].index.tolist()
-    dropped = set(group_sizes.index) - set(valid_groups)
-    if dropped:
-        print(f"  [Layer2] 以下分组细胞数<{min_cells}，已跳过: {sorted(dropped)}")
-
-    common_cells = wpsi.columns.intersection(meta.index)
-    records = {}
-    for gid in gene_ids:
-        row = wpsi.loc[gid, common_cells]
-        grouped_mean = row.groupby(meta.loc[common_cells, groupby_col]).mean()
-        records[gid] = grouped_mean.reindex(valid_groups)
-
-    wpsi_matrix = pd.DataFrame(records).T
-    wpsi_matrix.index.name = "gene_id"
-    gene_program_map = pd.Series(gene_program_map).reindex(wpsi_matrix.index)
-    gene_symbol_map = pd.Series(id_to_symbol).reindex(wpsi_matrix.index)
-
-    print(f"  gene x {groupby_col} wPSI矩阵: {wpsi_matrix.shape[0]} 个基因 x {wpsi_matrix.shape[1]} 个分组")
-    return wpsi_matrix, gene_program_map, gene_symbol_map

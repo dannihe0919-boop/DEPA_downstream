@@ -10,12 +10,9 @@ density_threshold: "0_01"
 h5ad_path: "data/covid_19_data/cnmf_output_identity_state/COVID_DEAPA_1231PAC_counts.h5ad"
 feature_anno_path: "data/covid_19_data/cnmf_input_identity_state/cnmf_feature_anno.csv"
 
-# 可选：没有就不填，对应 Layer1 会自动跳过
+# 可选：未提供 wPSI 时只跳过 Layer3，富集和 usage 仍可执行
 wpsi_matrix_path: "data/covid_19_data/PSI_results/movAPA_wPSI_matrix_df.rds"
-psi_matrix_path: "data/covid_19_data/PSI_results/movAPA_PSI_matrix_df.rds"
 
-# 可选：Layer3 自动推断模块用，来自 scAPAflow::build_depa_feature_object 的输出
-depa_feature_source_path: "data/covid_19_data/cnmf_input_identity_state/DEPA_feature_source.csv"
 gene_symbol_map_path: "configs/covid19_gene_symbol_map.csv"
 
 meta_columns:
@@ -70,7 +67,6 @@ contrasts:
     group_b: "pDC"
 
 z_threshold: 1.5
-top_n_pacs: 100
 min_cells_per_group: 20
 min_samples_per_group: 2
 enrichr_databases:
@@ -78,8 +74,6 @@ enrichr_databases:
   - "KEGG_2021_Human"
   - "MSigDB_Hallmark_2020"
   - "Reactome_2022"
-enrichr_cutoff_padj: 0.05
-diff_padj_cutoff: 0.05
 
 output_root: "outputs/covid_19/"
 

@@ -15,8 +15,7 @@ from .layer1_enrichment import ENRICHMENT_COLUMNS, run_functional_enrichment
 from .layer2_association import compute_contrast_association, summarize_program_associations
 from .layer3_direction import annotate_within_celltype, compute_population_direction
 
-PATH_KEYS = ['cnmf_dir', 'h5ad_path', 'feature_anno_path', 'wpsi_matrix_path', 'psi_matrix_path',
-             'depa_feature_source_path', 'gene_symbol_map_path', 'output_root']
+PATH_KEYS = ['cnmf_dir', 'h5ad_path', 'feature_anno_path', 'wpsi_matrix_path', 'gene_symbol_map_path', 'output_root']
 
 
 def load_analysis_config(path, *, root_dir=None, output_root=None, path_overrides=None) -> dict:

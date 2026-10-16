@@ -1,268 +1,12 @@
-"""
-纯画图函数。原则：只接收已经算好的结果（DataFrame/dict），不在这里做任何
-统计计算——计算逻辑都应该在 layer1/2/3 里，方便单独测试和复用。
-"""
-
+"""Plots for final Layer 0–3 results; no statistical tests or gene screening."""
 from __future__ import annotations
 
 import os
-
 import numpy as np
 import pandas as pd
 
-
-def plot_within_celltype_concordance(gene_tables: dict, program: str, out_dir: str) -> str:
-    """Plot Layer 3b core-gene effects directly from the final Layer 0 table."""
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-    from urllib.parse import quote
-
-    table = gene_tables[program]
-    selected = table.loc[table['is_core'] & table['within_celltype_mean_diff'].notna()].copy()
-    if selected.empty:
-        return ''
-    selected = selected.sort_values('within_celltype_mean_diff')
-    colors = {'concordant': '#55A868', 'discordant': '#C44E52', 'inconclusive': '#999999', 'not_tested': '#DDDDDD'}
-    fig, ax = plt.subplots(figsize=(7, max(3, len(selected) * .3)))
-    ax.barh(range(len(selected)), selected['within_celltype_mean_diff'],
-            color=[colors[label] for label in selected['concordance']])
-    ax.set_yticks(range(len(selected)), labels=selected['symbol'])
-    ax.axvline(0, color='black', linewidth=.8)
-    ax.set_xlabel('Mean wPSI difference (disease group B − group A)')
-    celltype = selected['within_celltype'].iloc[0]
-    expected = selected['within_celltype_expected_direction'].iloc[0]
-    ax.set_title(f'{program} within {celltype}; expected B−A: {expected}')
-    ax.legend(handles=[Patch(facecolor=color, label=label) for label, color in colors.items()], fontsize=8)
-    fig.tight_layout()
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f'layer3_within_celltype_{quote(str(program), safe="")}.png')
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    return path
-
-def plot_gene_wpsi_by_group(
-    gene_id: str,
-    data: dict,
-    config: dict,
-    groupby_col: str,
-    out_dir: str,
-    gene_symbol: str | None = None,
-) -> str:
-    """单个基因的wPSI在某个meta分组下的箱线图（叠加散点抖动），用single-cell级别
-    的wPSI值（不是取中位数后的），直接回答"这个基因的APA变化在各组里是什么样"。
-
-    Parameters
-    ----------
-    gene_id : str
-        要画的基因（wPSI矩阵的index）。
-    groupby_col : str
-        data["meta"]里的分组列名，如 config["meta_columns"]["celltype"]
-        或 contrasts里用到的列（如"group"）。
-    gene_symbol : str, optional
-        图标题显示用的symbol，不传则直接显示gene_id。
-    """
-    import matplotlib.pyplot as plt
-
-    wpsi = data.get("wpsi")
-    if wpsi is None:
-        print("  [Layer1] 未提供 wPSI 矩阵，跳过单基因分组图")
-        return ""
-    if gene_id not in wpsi.index:
-        print(f"  [Layer1] {gene_id} 不在 wPSI 矩阵里，跳过")
-        return ""
-
-    meta = data["meta"]
-    common_cells = wpsi.columns.intersection(meta.index)
-    vals = wpsi.loc[gene_id, common_cells]
-    groups = meta.loc[common_cells, groupby_col]
-
-    plot_df = pd.DataFrame({"wpsi": vals.values, "group": groups.values}).dropna()
-    if len(plot_df) == 0:
-        print(f"  [Layer1] {gene_id} 在该分组列下没有有效数据，跳过")
-        return ""
-
-    os.makedirs(out_dir, exist_ok=True)
-    order = sorted(plot_df["group"].unique())
-    data_by_group = [plot_df.loc[plot_df["group"] == g, "wpsi"].values for g in order]
-
-    fig, ax = plt.subplots(figsize=(max(4, 0.8 * len(order)), 4))
-    bp = ax.boxplot(data_by_group, labels=order, showfliers=False, patch_artist=True)
-    for patch in bp["boxes"]:
-        patch.set_facecolor("#4C72B0")
-        patch.set_alpha(0.5)
-    # 叠加抖动散点，看真实分布不只是箱线摘要
-    rng = np.random.default_rng(0)
-    for i, vals_i in enumerate(data_by_group, start=1):
-        jitter = rng.normal(i, 0.06, size=len(vals_i))
-        ax.scatter(jitter, vals_i, s=4, alpha=0.3, color="black")
-
-    label = gene_symbol or gene_id
-    ax.set_ylabel("wPSI (per cell)")
-    ax.set_title(f"{label} — wPSI by {groupby_col}")
-    plt.xticks(rotation=30, ha="right")
-    fig.tight_layout()
-
-    out_path = os.path.join(out_dir, f"layer1_gene_wpsi_{label}_{groupby_col}.png")
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"  已保存: {out_path}")
-    return out_path
-
-def plot_leading_genes_bar(leading_genes: dict, program: str, out_dir: str, direction_label: str = "") -> str:
-    """画单个program的leading genes条形图：横轴delta_from_bg，纵轴基因symbol，
-    按|delta|降序排列。用来直观回答"这个program的方向判定主要是谁在驱动"。
-
-    Parameters
-    ----------
-    leading_genes : dict
-        compute_leading_genes() 的返回值。
-    program : str
-        要画哪个program。
-    direction_label : str
-        可选，program整体方向（"Proximal"/"Distal"），显示在标题里。
-    """
-    import matplotlib.pyplot as plt
-
-    df = leading_genes.get(program)
-    if df is None or len(df) == 0:
-        print(f"  [Layer1] {program} 没有leading genes，跳过画图")
-        return ""
-
-    os.makedirs(out_dir, exist_ok=True)
-    df = df.sort_values("delta_from_bg")
-
-    fig, ax = plt.subplots(figsize=(6, max(3, 0.35 * len(df))))
-    colors = ["#DD8452" if v > 0 else "#4C72B0" for v in df["delta_from_bg"]]
-    ax.barh(df["symbol"], df["delta_from_bg"], color=colors)
-    ax.axvline(0, color="black", linewidth=0.8)
-    ax.set_xlabel("gene wPSI − program background median")
-    title = f"{program} leading genes"
-    if direction_label:
-        title += f" ({direction_label})"
-    ax.set_title(title)
-    fig.tight_layout()
-
-    out_path = os.path.join(out_dir, f"layer1_leading_genes_{program}.png")
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"  已保存: {out_path}")
-    return out_path
-
-def plot_gene_wpsi_by_group(
-    gene_id: str,
-    data: dict,
-    config: dict,
-    groupby_col: str,
-    out_dir: str,
-    gene_symbol: str | None = None,
-) -> str:
-    """单个基因的wPSI在某个meta分组下的箱线图（叠加散点抖动），用single-cell级别
-    的wPSI值（不是取中位数后的），直接回答"这个基因的APA变化在各组里是什么样"。
-
-    Parameters
-    ----------
-    gene_id : str
-        要画的基因（wPSI矩阵的index）。
-    groupby_col : str
-        data["meta"]里的分组列名，如 config["meta_columns"]["celltype"]
-        或 contrasts里用到的列（如"group"）。
-    gene_symbol : str, optional
-        图标题显示用的symbol，不传则直接显示gene_id。
-    """
-    import matplotlib.pyplot as plt
-
-    wpsi = data.get("wpsi")
-    if wpsi is None:
-        print("  [Layer1] 未提供 wPSI 矩阵，跳过单基因分组图")
-        return ""
-    if gene_id not in wpsi.index:
-        print(f"  [Layer1] {gene_id} 不在 wPSI 矩阵里，跳过")
-        return ""
-
-    meta = data["meta"]
-    common_cells = wpsi.columns.intersection(meta.index)
-    vals = wpsi.loc[gene_id, common_cells]
-    groups = meta.loc[common_cells, groupby_col]
-
-    plot_df = pd.DataFrame({"wpsi": vals.values, "group": groups.values}).dropna()
-    if len(plot_df) == 0:
-        print(f"  [Layer1] {gene_id} 在该分组列下没有有效数据，跳过")
-        return ""
-
-    os.makedirs(out_dir, exist_ok=True)
-    order = sorted(plot_df["group"].unique())
-    data_by_group = [plot_df.loc[plot_df["group"] == g, "wpsi"].values for g in order]
-
-    fig, ax = plt.subplots(figsize=(max(4, 0.8 * len(order)), 4))
-    bp = ax.boxplot(data_by_group, labels=order, showfliers=False, patch_artist=True)
-    for patch in bp["boxes"]:
-        patch.set_facecolor("#4C72B0")
-        patch.set_alpha(0.5)
-    # 叠加抖动散点，看真实分布不只是箱线摘要
-    rng = np.random.default_rng(0)
-    for i, vals_i in enumerate(data_by_group, start=1):
-        jitter = rng.normal(i, 0.06, size=len(vals_i))
-        ax.scatter(jitter, vals_i, s=4, alpha=0.3, color="black")
-
-    label = gene_symbol or gene_id
-    ax.set_ylabel("wPSI (per cell)")
-    ax.set_title(f"{label} — wPSI by {groupby_col}")
-    plt.xticks(rotation=30, ha="right")
-    fig.tight_layout()
-
-    out_path = os.path.join(out_dir, f"layer1_gene_wpsi_{label}_{groupby_col}.png")
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"  已保存: {out_path}")
-    return out_path
-
-
-def plot_jaccard_heatmap(jaccard_mat: pd.DataFrame, out_dir: str, module_labels: pd.DataFrame | None = None) -> str:
-    """画 program 间基因集 Jaccard 相似度热图，可选按模块分组排序。
-
-    Parameters
-    ----------
-    jaccard_mat : DataFrame
-        layer3_markers.compute_jaccard_matrix() 的返回值。
-    out_dir : str
-        保存目录。
-    module_labels : DataFrame, optional
-        layer3_markers.resolve_module_labels() 的返回值（需要含"module"列），
-        提供时会按模块把program重新排序聚在一起，方便看模块内/模块间的重叠模式。
-    """
-    import matplotlib.pyplot as plt
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    programs = list(jaccard_mat.index)
-    if module_labels is not None and "module" in module_labels.columns:
-        order = module_labels.loc[programs].sort_values("module").index.tolist()
-    else:
-        order = sorted(programs)
-    mat = jaccard_mat.loc[order, order]
-
-    fig, ax = plt.subplots(figsize=(max(4, 0.6 * len(order)), max(4, 0.6 * len(order))))
-    off_diag = mat.values[~np.eye(len(order), dtype=bool)]
-    vmax = max(0.05, off_diag.max() if len(off_diag) else 0.05)
-    im = ax.imshow(mat.values, cmap="viridis", vmin=0, vmax=vmax)
-    ax.set_xticks(range(len(order)))
-    ax.set_xticklabels(order, rotation=45, ha="right")
-    ax.set_yticks(range(len(order)))
-    ax.set_yticklabels(order)
-    for i in range(len(order)):
-        for j in range(len(order)):
-            val = mat.values[i, j]
-            ax.text(j, i, f"{val:.2f}", ha="center", va="center",
-                     color="white" if val < vmax * 0.6 else "black", fontsize=8)
-    ax.set_title("Program gene-set Jaccard similarity")
-    fig.colorbar(im, ax=ax, label="Jaccard index", fraction=0.046, pad=0.04)
-    fig.tight_layout()
-
-    out_path = os.path.join(out_dir, "layer3_jaccard_heatmap.png")
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"  已保存: {out_path}")
-    return out_path
+CATEGORY_ORDER = ["disease", "identity", "state"]
+CATEGORY_COLORS = {"disease": "#C44E52", "identity": "#4C72B0", "state": "#55A868"}
 
 
 def plot_enrichment_bubble(
@@ -270,7 +14,7 @@ def plot_enrichment_bubble(
         out_dir: str,
         top_n: int = 10,
         padj_threshold: float = 0.05,
-        filename: str = "layer3_enrichment_bubble.png",
+        filename: str = "layer1_enrichment_bubble.png",
 ) -> str:
     """富集结果气泡图：每个label取padj最小的前top_n条term，跨label并排展示。
 
@@ -280,7 +24,7 @@ def plot_enrichment_bubble(
     Parameters
     ----------
     enrichment_by_label : dict
-        layer3_markers.run_enrichment() 的返回值（{label: DataFrame or None}）。
+        按 core 或 specific 取出的 Layer1 结果（{program: DataFrame}）。
     out_dir : str
         保存目录。
     top_n : int
@@ -289,7 +33,7 @@ def plot_enrichment_bubble(
         只展示padj低于此阈值的term；某个label如果一条都不满足，会被跳过
         （不在图上占位），并打印提示。
     filename : str
-        输出图片文件名（不含目录）。默认 "layer3_enrichment_bubble.png"。
+        输出图片文件名（不含目录）。默认 "layer1_enrichment_bubble.png"。
         同一批分析里如果要对不同基因列表（比如"专属marker" vs "全部核心基因"）
         各画一张图，传不同的 filename 避免互相覆盖。
     """
@@ -297,7 +41,7 @@ def plot_enrichment_bubble(
 
     valid = {k: v for k, v in enrichment_by_label.items() if v is not None and len(v) > 0}
     if not valid:
-        print("  [Layer3] 没有任何富集结果，跳过画图")
+        print("  [Layer1] 没有任何富集结果，跳过画图")
         return ""
 
     os.makedirs(out_dir, exist_ok=True)
@@ -312,7 +56,7 @@ def plot_enrichment_bubble(
             rows.append({"label": label, "term": r["term"], "padj": r["padj"],
                          "combined_score": r["combined_score"]})
     if not rows:
-        print(f"  [Layer3] 所有label都没有padj<{padj_threshold}的term，跳过画图")
+        print(f"  [Layer1] 所有label都没有padj<{padj_threshold}的term，跳过画图")
         return ""
 
     plot_df = pd.DataFrame(rows)
@@ -382,304 +126,275 @@ def plot_enrichment_bubble(
 
 
 
-def plot_usage_binned_trend(
-    summary: pd.DataFrame,
-    top_genes_binned: pd.DataFrame,
-    program: str,
-    spearman_r: float,
-    spearman_p: float,
-    program_direction: pd.DataFrame,
-    out_dir: str,
-    filename: str | None = None,   # 新增
-) -> str:
-    """usage分箱趋势图：主线=leading genes整体的每细胞平均wPSI(95% CI阴影)，
-    细虚线=效应量最大的代表基因，标题对照compute_program_direction()判定的
-    方向与这里算出的Spearman相关是否一致。
+def plot_association_heatmap(assoc_results: dict, config: dict, out_dir: str) -> str:
+    """画所有 contrast x program 的 AUC 汇总热图，按 category 分组展示。
 
-    Parameters
-    ----------
-    summary, top_genes_binned, spearman_r, spearman_p :
-        compute_usage_binned_wpsi() 的返回值，原样传入。
-    program_direction : DataFrame
-        compute_program_direction() 的返回值，用来在标题里标注方向判断。
+    列先按 category（disease -> identity -> state -> 其他，未知类别追加在
+    最后）分组，组内按名字排序；组间画分隔线；顶部加一条颜色条标注每列
+    属于哪个 category，并附图例。
     """
+    valid = {k: v for k, v in assoc_results.items() if v is not None}
+    if not valid:
+        print("  [Layer2] 没有任何 contrast 有有效结果，跳过画图")
+        return ""
+
     import matplotlib.pyplot as plt
-
-    os.makedirs(out_dir, exist_ok=True)
-    x = np.arange(len(summary))
-
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.plot(x, summary["wpsi_mean"], color="black", linewidth=2.5,
-            label=f"{program} leading genes mean wPSI", zorder=3)
-    ax.fill_between(x, summary["wpsi_ci_low"], summary["wpsi_ci_high"],
-                     color="gray", alpha=0.25, zorder=2)
-
-    palette = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B2", "#937860"]
-    for i, gene in enumerate(top_genes_binned.columns):
-        ax.plot(x, top_genes_binned[gene].values, color=palette[i % len(palette)],
-                linewidth=1, alpha=0.7, linestyle="--", label=gene, zorder=1)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"{v:.2f}" for v in summary["usage_median"]], rotation=45, ha="right")
-    ax.set_xlabel(f"{program} usage (bin median)")
-    ax.set_ylabel("wPSI")
-
-    direction_label = program_direction.loc[program, "direction"] if program in program_direction.index else ""
-    ax.set_title(f"{program} (direction: {direction_label}) | "
-                 f"usage-wPSI Spearman r={spearman_r:.2f}, p={spearman_p:.1e}")
-
-    ax.legend(fontsize=8, loc="best", frameon=False)
-    fig.tight_layout()
-
-    if filename is None:
-        filename = f"layer1_usage_binned_trend_{program}.png"
-    out_path = os.path.join(out_dir, filename)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"  已保存: {out_path}")
-    return out_path
-
-
-def plot_gene_celltype_heatmap(
-    wpsi_matrix: pd.DataFrame,
-    gene_program_map: pd.Series,
-    gene_symbol_map: pd.Series,
-    out_dir: str,
-    row_zscore: bool = True,
-    filename: str = "layer2_gene_celltype_heatmap.png",
-) -> str:
-    """gene x celltype(或其它分组) 的wPSI热图，行按program分组排列并用色条
-    标注归属。默认对每个基因跨分组做z-score（更容易看出"相对哪些分组wPSI
-    偏高/偏低"），传row_zscore=False展示原始wPSI均值。用纯matplotlib实现
-    （和plot_jaccard_heatmap一致的风格，不引入seaborn依赖）。
-
-    Parameters
-    ----------
-    wpsi_matrix, gene_program_map, gene_symbol_map :
-        compute_gene_celltype_wpsi() 的返回值，原样传入。
-    """
-    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
     from matplotlib.patches import Patch
 
     os.makedirs(out_dir, exist_ok=True)
+    programs = sorted(next(iter(valid.values())).index.tolist())
 
-    programs = sorted(gene_program_map.unique())
-    cmap_prog = plt.get_cmap("tab10")
-    program_color = {p: cmap_prog(i % 10) for i, p in enumerate(programs)}
+    # 按 category 分组排序列
+    cat_of = {name: df.attrs.get("category", "other") for name, df in valid.items()}
+    all_cats = list(dict.fromkeys(CATEGORY_ORDER + sorted(set(cat_of.values()) - set(CATEGORY_ORDER))))
+    ordered_names = sorted(valid.keys(), key=lambda n: (all_cats.index(cat_of[n]), n))
 
-    order = gene_program_map.sort_values().index
-    mat = wpsi_matrix.loc[order].copy()
+    mat = pd.DataFrame({name: valid[name]["auc"] for name in ordered_names}).reindex(programs)
+    col_categories = [cat_of[name] for name in ordered_names]
 
-    if row_zscore:
-        mat = mat.sub(mat.mean(axis=1), axis=0).div(mat.std(axis=1).replace(0, np.nan), axis=0)
-        cbar_label, vmin, vmax = "wPSI (row z-score)", -2, 2
-    else:
-        cbar_label, vmin, vmax = "mean wPSI", None, None
+    # 给每个出现过的 category 分配颜色（预设的用预设色，其余自动分配）
+    cmap_fallback = plt.get_cmap("Set2")
+    color_lookup = dict(CATEGORY_COLORS)
+    for i, c in enumerate(all_cats):
+        if c not in color_lookup:
+            color_lookup[c] = cmap_fallback(i % 8)
 
-    row_labels = [gene_symbol_map.get(g, g) for g in mat.index]
-    n_rows, n_cols = mat.shape
-
-    fig, (ax_color, ax_main) = plt.subplots(
-        1, 2, figsize=(max(6, 0.7 * n_cols) + 1.5, max(4, 0.28 * n_rows)),
-        gridspec_kw={"width_ratios": [0.4, n_cols]},
+    n_cols = len(ordered_names)
+    fig, (strip_ax, ax) = plt.subplots(
+        2, 1, figsize=(max(5, 0.55 * n_cols), max(3, 0.5 * len(programs)) + 0.6),
+        gridspec_kw={"height_ratios": [0.4, max(3, 0.5 * len(programs))], "hspace": 0.05},
+        sharex=True,
     )
-    ax_color.imshow([[program_color[gene_program_map.loc[g]]] for g in mat.index], aspect="auto")
-    ax_color.set_xticks([]); ax_color.set_yticks([])
 
-    im = ax_main.imshow(mat.values, cmap="RdBu_r", vmin=vmin, vmax=vmax, aspect="auto")
-    ax_main.set_xticks(range(n_cols)); ax_main.set_xticklabels(mat.columns, rotation=45, ha="right")
-    ax_main.set_yticks(range(n_rows)); ax_main.set_yticklabels(row_labels, fontsize=8)
-    ax_main.set_title("Leading gene wPSI by group (rows colored by program)")
-    fig.colorbar(im, ax=ax_main, label=cbar_label, fraction=0.03, pad=0.02)
+    # ── 顶部 category 颜色条 ──
+    cat_codes = [all_cats.index(c) for c in col_categories]
+    used_cats = [c for c in all_cats if c in set(col_categories)]
+    strip_cmap = ListedColormap([color_lookup[c] for c in used_cats])
+    code_remap = {all_cats.index(c): i for i, c in enumerate(used_cats)}
+    strip_vals = np.array([[code_remap[code] for code in cat_codes]])
+    strip_ax.imshow(strip_vals, aspect="auto", cmap=strip_cmap,
+                     vmin=-0.5, vmax=len(used_cats) - 0.5)
+    strip_ax.set_yticks([])
+    strip_ax.set_xticks([])
+    for spine in strip_ax.spines.values():
+        spine.set_visible(False)
+    legend_handles = [Patch(facecolor=color_lookup[c], label=c) for c in used_cats]
+    strip_ax.legend(handles=legend_handles, loc="lower left", bbox_to_anchor=(0, 1.05),
+                     ncol=len(used_cats), fontsize=8, frameon=False)
 
-    handles = [Patch(facecolor=c, label=p) for p, c in program_color.items()]
-    ax_main.legend(handles=handles, title="program", bbox_to_anchor=(1.3, 1), loc="upper left", fontsize=8)
+    # ── 主热图 ──
+    im = ax.imshow(mat.values, cmap="RdBu_r", vmin=0, vmax=1, aspect="auto")
+    ax.set_xticks(range(n_cols))
+    ax.set_xticklabels(mat.columns, rotation=45, ha="right", fontsize=8)
+    ax.set_yticks(range(len(programs)))
+    ax.set_yticklabels(programs)
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            val = mat.values[i, j]
+            if pd.notna(val):
+                ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                         color="white" if abs(val - 0.5) > 0.25 else "black", fontsize=7)
 
-    fig.tight_layout()
-    out_path = os.path.join(out_dir, filename)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  已保存: {out_path}")
-    return out_path
+    # 组间分隔线
+    boundaries = []
+    for i in range(1, n_cols):
+        if col_categories[i] != col_categories[i - 1]:
+            boundaries.append(i - 0.5)
+    for b in boundaries:
+        ax.axvline(b, color="black", linewidth=1.2)
 
+    fig.suptitle("Program usage ~ contrast association (AUC)", y=0.98)
+    fig.subplots_adjust(left=0.12, right=0.88, bottom=0.32, top=0.88)
+    fig.colorbar(im, ax=[strip_ax, ax], label="AUC (0.5 = no association)", fraction=0.025, pad=0.02)
 
-def plot_within_celltype_comparison(
-    values_a: np.ndarray,
-    values_b: np.ndarray,
-    label_a: str,
-    label_b: str,
-    ylabel: str,
-    title: str,
-    out_path: str,
-) -> str:
-    """通用的两组对比箱线图（叠加抖动散点），供组内比较（wPSI或usage）复用，
-    不重复写画图逻辑。
-
-    Parameters
-    ----------
-    values_a, values_b : array-like
-        两组的原始数值（如某基因wPSI，或某program usage）。
-    out_path : str
-        完整输出文件路径（含文件名），由调用方按wpsi/usage拼不同的文件名。
-    """
-    import matplotlib.pyplot as plt
-
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    fig, ax = plt.subplots(figsize=(4.5, 4))
-    bp = ax.boxplot([values_a, values_b], labels=[label_a, label_b],
-                     showfliers=False, patch_artist=True)
-    for patch, color in zip(bp["boxes"], ["#4C72B0", "#C44E52"]):
-        patch.set_facecolor(color)
-        patch.set_alpha(0.5)
-
-    rng = np.random.default_rng(0)
-    for i, vals in enumerate([values_a, values_b], start=1):
-        jitter = rng.normal(i, 0.06, size=len(vals))
-        ax.scatter(jitter, vals, s=4, alpha=0.3, color="black")
-
-    ax.set_ylabel(ylabel)
-    ax.set_title(title, fontsize=10)
-    fig.tight_layout()
+    out_path = os.path.join(out_dir, "layer2_association_heatmap.png")
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"  已保存: {out_path}")
     return out_path
 
 
-def plot_within_celltype_effect_summary(
-    effect_df: pd.DataFrame,
-    program: str,
-    celltype: str,
+
+def plot_program_umap_grid(data: dict, config: dict, out_dir: str) -> str:
+    """全 program 的 UMAP 网格图（每个 program 一张小图，按 usage 染色）。
+
+    第一张图固定是 cell_type 分类着色（若 config['meta_columns'] 里配置了
+    celltype列），作为参照，方便直接对照某个program的高usage区域落在哪个
+    细胞类型上。每个类型簇的中心位置直接标注类型名文字（白色描边保证在
+    深色点上也清晰可读），不需要额外看图例对照颜色。
+
+    需要 config["meta_columns"] 里配置了 umap1/umap2，没配置则跳过并提示。
+    """
+    meta_cols = config["meta_columns"]
+    if "umap1" not in meta_cols or "umap2" not in meta_cols:
+        print("  [Layer2] 未配置 UMAP 坐标列，跳过 UMAP 网格图")
+        return ""
+
+    import matplotlib.pyplot as plt
+    import matplotlib.patheffects as pe
+
+    os.makedirs(out_dir, exist_ok=True)
+    usage = data["usage"]
+    meta = data["meta"]
+    programs = data["programs"]
+    common_idx = usage.index.intersection(meta.index)
+
+    x = meta.loc[common_idx, meta_cols["umap1"]].values
+    y = meta.loc[common_idx, meta_cols["umap2"]].values
+
+    celltype_col = meta_cols.get("celltype")
+    has_celltype = celltype_col is not None and celltype_col in meta.columns
+
+    panels = (["__celltype__"] if has_celltype else []) + list(programs)
+    n = len(panels)
+    ncols = min(3, n)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3.5 * nrows), squeeze=False)
+
+    for idx, panel in enumerate(panels):
+        ax = axes[idx // ncols][idx % ncols]
+        if panel == "__celltype__":
+            cats = meta.loc[common_idx, celltype_col].astype(str)
+            uniq = sorted(cats.unique())
+            cmap = plt.get_cmap("tab20", max(len(uniq), 1))
+            color_map = {c: cmap(i) for i, c in enumerate(uniq)}
+            point_colors = cats.map(color_map).tolist()
+            ax.scatter(x, y, c=point_colors, s=3, linewidths=0)
+            ax.set_title("cell_type (reference)")
+            # 每个类型簇中心直接标文字，不用图例
+            for c in uniq:
+                mask = cats.values == c
+                xm, ym = np.median(x[mask]), np.median(y[mask])
+                ax.text(xm, ym, c, fontsize=8, fontweight="bold", ha="center", va="center",
+                         path_effects=[pe.withStroke(linewidth=2.5, foreground="white")])
+        else:
+            c = usage.loc[common_idx, panel].values
+            sc = ax.scatter(x, y, c=c, cmap="viridis", s=3, linewidths=0)
+            ax.set_title(panel)
+            fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    for idx in range(n, nrows * ncols):
+        axes[idx // ncols][idx % ncols].axis("off")
+
+    fig.suptitle("Program usage on UMAP")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    out_path = os.path.join(out_dir, "layer2_program_umap_grid.png")
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  已保存: {out_path}")
+    return out_path
+
+
+
+def plot_population_direction(
+    population_direction: pd.DataFrame,
     out_dir: str,
+    padj_threshold: float = 0.05,
+    pval_threshold: float = 0.05,
+    filename: str = "layer3_population_direction.png",
 ) -> str:
-    """画某个program的leading gene在细胞类型内部对照的效应量条形图，
-    按supports/opposes/no_meaningful_diff三类着色，直观呈现
-    "program内部基因是否同质地支持整体方向"这个问题。
+    """画方向检验的汇总条形图（delta_median，按方向着色，标注显著性）。
+
+    传入的是 compute_population_direction() 的结果，不重新计算。
+    样本量小、检验普遍不显著时（比如COVID这批数据），仍然按 delta_median
+    大小排序展示，用星号区分"padj显著"/"仅raw pval显著"/"不显著"三档，
+    不因为没有显著结果就不出图——描述性的方向倾向本身也是有信息量的。
 
     Parameters
     ----------
-    effect_df : DataFrame
-        summarize_leading_gene_within_celltype() 的返回值
-        （index=symbol，需要 mean_diff 和 category 列）。
-    """
-    import matplotlib.pyplot as plt
+    population_direction : DataFrame
+        compute_population_direction() 的返回值。
+    out_dir : str
+        图片保存目录（自动创建）。
+    padj_threshold, pval_threshold : float
+        显著性星号标注阈值。
 
-    if effect_df is None or len(effect_df) == 0:
-        print("  [Layer1] effect_df 为空，跳过画图")
+    Returns
+    -------
+    str: 保存的图片路径。若 population_direction 为 None，打印提示并返回空字符串。
+    """
+    if population_direction is None:
+        print("  [Layer3] population_direction 为 None，跳过画图")
         return ""
 
+    import matplotlib.pyplot as plt
+
     os.makedirs(out_dir, exist_ok=True)
-    df = effect_df.sort_values("mean_diff")
 
-    color_map = {"supports": "#DD8452", "opposes": "#4C72B0", "no_meaningful_diff": "#B0B0B0"}
-    colors = [color_map[c] for c in df["category"]]
+    df = population_direction.copy()
+    df = df[df["direction"] != "NA"].sort_values("delta_median")
+    if len(df) == 0:
+        print("  [Layer3] 没有任何 program 完成检验，跳过画图")
+        return ""
 
-    fig, ax = plt.subplots(figsize=(6, max(3, 0.4 * len(df))))
-    ax.barh(df.index, df["mean_diff"], color=colors)
+    def _sig_marker(row):
+        if pd.notna(row["padj"]) and row["padj"] < padj_threshold:
+            return "**"
+        if pd.notna(row["pval"]) and row["pval"] < pval_threshold:
+            return "*"
+        return ""
+
+    colors = ["#4C72B0" if d == "Proximal" else "#DD8452" for d in df["direction"]]
+
+    fig, ax = plt.subplots(figsize=(7, max(3, 0.5 * len(df))))
+    bars = ax.barh(df.index, df["delta_median"], color=colors)
     ax.axvline(0, color="black", linewidth=0.8)
-    ax.set_xlabel(f"mean wPSI diff (within {celltype})")
-    ax.set_title(f"{program} leading genes — within-celltype effect\n"
-                 f"orange=supports, blue=opposes, gray=no meaningful diff")
+    ax.set_xlabel("Δ median wPSI (foreground − background)")
+    ax.set_title("Program APA direction (wPSI-based MWU test)\n"
+                  "blue = Proximal, orange = Distal   (** padj<%.2f, * pval<%.2f)"
+                  % (padj_threshold, pval_threshold))
 
-    from matplotlib.patches import Patch
-    legend_handles = [Patch(facecolor=c, label=l) for l, c in color_map.items()]
-    ax.legend(handles=legend_handles, loc="lower right", fontsize=7)
+    max_abs = df["delta_median"].abs().max()
+    pad = max_abs * 0.35 + 1e-6
+    ax.set_xlim(df["delta_median"].min() - pad, df["delta_median"].max() + pad)
+
+    for bar, (_, row) in zip(bars, df.iterrows()):
+        marker = _sig_marker(row)
+        label = f"n={int(row['n_fg_genes'])}{'  ' + marker if marker else ''}"
+        x = bar.get_width()
+        offset = pad * 0.15 if x >= 0 else -pad * 0.15
+        ha = "left" if x >= 0 else "right"
+        ax.text(x + offset, bar.get_y() + bar.get_height() / 2, label,
+                 va="center", ha=ha, fontsize=8)
 
     fig.tight_layout()
-    out_path = os.path.join(out_dir, f"layer1_within_celltype_effect_{program}.png")
+    out_path = os.path.join(out_dir, filename)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"  已保存: {out_path}")
     return out_path
 
 
-def plot_driver_gene_heatmap(
-    driver_genes: pd.DataFrame,
-    wpsi_matrix: pd.DataFrame,
-    gene_symbol_map: pd.Series,
-    out_dir: str,
-    program: str,
-    row_zscore: bool = True,
-    filename: str | None = None,
-) -> str:
-    """针对单个program，把其Top富集term的驱动基因（且同时是leading gene的
-    那些）单独画一张聚焦热图，行按term分组着色、图例标term名，直接呈现
-    "功能通路 -> 具体基因 -> 各细胞类型wPSI"这条完整链路。
 
-    Parameters
-    ----------
-    driver_genes : DataFrame
-        extract_enrichment_driver_genes() 的返回值（未过滤，函数内部按
-        program筛选，且只保留in_leading_genes=True的行——不在leading gene
-        里的基因没有gene_id，没法在wpsi_matrix里定位，会被跳过并打印提示）。
-    wpsi_matrix, gene_symbol_map :
-        layer2_association.compute_gene_celltype_wpsi() 返回的三元组里的
-        第一个和第三个（这里不需要gene_program_map，本图行分组用term而不是
-        program，因为这里只画单个program）。
-    program : str
-        要画哪个program。
-    """
+def plot_within_celltype_concordance(gene_tables: dict, program: str, out_dir: str) -> str:
+    """Plot Layer 3b core-gene effects directly from the final Layer 0 table."""
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
+    from urllib.parse import quote
 
-    os.makedirs(out_dir, exist_ok=True)
-
-    sub = driver_genes[(driver_genes["program"] == program) & (driver_genes["in_leading_genes"])]
-    if len(sub) == 0:
-        print(f"  [{program}] 没有可用的驱动基因(都不在leading genes里，或该program没有enrichment结果)，跳过画图")
-        return ""
-
-    # 同一个基因可能出现在多个term里，保留第一次出现的term作为它的分组标签
-    sub = sub.drop_duplicates(subset="gene_id", keep="first")
-    gene_ids = [g for g in sub["gene_id"] if g in wpsi_matrix.index]
-    n_missing = len(sub) - len(gene_ids)
-    if n_missing:
-        print(f"  [{program}] {n_missing}个驱动基因不在wpsi_matrix里"
-              f"（可能compute_gene_celltype_wpsi用了不同的min_cells过滤），已跳过")
-    if not gene_ids:
-        print(f"  [{program}] 没有驱动基因能在wpsi_matrix里找到，跳过画图")
-        return ""
-
-    sub = sub.set_index("gene_id").loc[gene_ids]
-    mat = wpsi_matrix.loc[gene_ids].copy()
-
-    if row_zscore:
-        mat = mat.sub(mat.mean(axis=1), axis=0).div(mat.std(axis=1).replace(0, np.nan), axis=0)
-        cbar_label, vmin, vmax = "wPSI (row z-score)", -2, 2
-    else:
-        cbar_label, vmin, vmax = "mean wPSI", None, None
-
-    terms = sub["term"].tolist()
-    unique_terms = list(dict.fromkeys(terms))
-    cmap_term = plt.get_cmap("Set2")
-    term_color = {t: cmap_term(i % 8) for i, t in enumerate(unique_terms)}
-
-    row_labels = [gene_symbol_map.get(g, g) for g in mat.index]
-    n_rows, n_cols = mat.shape
-
-    fig, (ax_color, ax_main) = plt.subplots(
-        1, 2, figsize=(max(6, 0.7 * n_cols) + 2.5, max(3, 0.32 * n_rows)),
-        gridspec_kw={"width_ratios": [0.4, n_cols]},
-    )
-    ax_color.imshow([[term_color[t]] for t in terms], aspect="auto")
-    ax_color.set_xticks([]); ax_color.set_yticks([])
-
-    im = ax_main.imshow(mat.values, cmap="RdBu_r", vmin=vmin, vmax=vmax, aspect="auto")
-    ax_main.set_xticks(range(n_cols)); ax_main.set_xticklabels(mat.columns, rotation=45, ha="right")
-    ax_main.set_yticks(range(n_rows)); ax_main.set_yticklabels(row_labels, fontsize=8)
-    ax_main.set_title(f"{program} — enrichment driver genes (rows colored by term)")
-    fig.colorbar(im, ax=ax_main, label=cbar_label, fraction=0.03, pad=0.02)
-
-    term_labels_short = {t: (t[:40] + "…" if len(t) > 40 else t) for t in unique_terms}
-    handles = [Patch(facecolor=term_color[t], label=term_labels_short[t]) for t in unique_terms]
-    ax_main.legend(handles=handles, title="term", bbox_to_anchor=(1.3, 1), loc="upper left", fontsize=7)
-
+    table = gene_tables[program]
+    selected = table.loc[table['is_core'] & table['within_celltype_mean_diff'].notna()].copy()
+    if selected.empty:
+        return ''
+    selected = selected.sort_values('within_celltype_mean_diff')
+    colors = {'concordant': '#55A868', 'discordant': '#C44E52', 'inconclusive': '#999999', 'not_tested': '#DDDDDD'}
+    fig, ax = plt.subplots(figsize=(7, max(3, len(selected) * .3)))
+    ax.barh(range(len(selected)), selected['within_celltype_mean_diff'],
+            color=[colors[label] for label in selected['concordance']])
+    ax.set_yticks(range(len(selected)), labels=selected['symbol'])
+    ax.axvline(0, color='black', linewidth=.8)
+    ax.set_xlabel('Mean wPSI difference (disease group B − group A)')
+    celltype = selected['within_celltype'].iloc[0]
+    expected = selected['within_celltype_expected_direction'].iloc[0]
+    ax.set_title(f'{program} within {celltype}; expected B−A: {expected}')
+    ax.legend(handles=[Patch(facecolor=color, label=label) for label, color in colors.items()], fontsize=8)
     fig.tight_layout()
-    if filename is None:
-        filename = f"layer3_driver_gene_heatmap_{program}.png"
-    out_path = os.path.join(out_dir, filename)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f'layer3_within_celltype_{quote(str(program), safe="")}.png')
+    fig.savefig(path, dpi=150)
     plt.close(fig)
-    print(f"  已保存: {out_path}")
-    return out_path
+    return path

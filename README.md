@@ -14,9 +14,11 @@ Layer1 与 Layer2 互不依赖。编号采用报告的叙事顺序；新流程�
 
 ## 安装和运行
 
-Python ≥3.10：
+Python ≥3.10。建议使用独立环境，避免修改 Conda base 中其他项目的依赖：
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -e '.[notebook]'
 # 可选：python -m pip install -e '.[xgboost]'
 python -m depa_downstream.pipeline --config configs/covid19.yaml \
@@ -35,7 +37,27 @@ depa-analyze --config configs/pre_t.yaml --output-root "$PWD/analysis_results/pr
   --path gene_symbol_map_path="$PWD/configs/pre_t_gene_symbol_map.csv"
 ```
 
-两份主 Notebook 已改为新版顺序，配置只加载一次；Pre-T Notebook 通过一个 `DATA_ROOT` 覆盖旧路径。COVID Notebook 保留既有 P03 样本级补充分析，并改为直接读取 Layer0 核心基因。旧探索代码（不含旧单元输出）保存在 `notebooks/legacy/`；旧模块及导出函数继续保留作兼容，新流程不调用它们重新筛选基因。
+两份主 Notebook 是最终维护入口，配置只加载一次；Pre-T Notebook 通过一个 `DATA_ROOT` 覆盖数据路径。COVID Notebook 保留 P03 样本级补充分析，直接读取 Layer0 核心基因。更新代码后重启 Notebook 内核，确保使用最终接口。
+
+## 最终目录与接口
+
+```text
+depa_downstream/
+  __init__.py              # 仅导出最终公共接口
+  config_schema.py         # 配置检查
+  io_layer.py              # 权重、usage、metadata、wPSI、symbol 读取
+  layer0_identity.py       # 唯一基因身份表
+  layer1_enrichment.py     # 默认数据库与自定义背景富集
+  layer2_association.py    # usage 关联及自动细胞类型选择
+  layer3_direction.py      # 3a 方向与 3b 组内标注
+  integration.py          # 富集 × 一致性证据
+  pipeline.py             # 配置路径、运行入口、分层导出
+  viz.py                  # 全部绘图函数
+```
+
+不再保留旧分析模块、兼容接口、历史 Notebook 副本或生成旧代码的 shell 脚本；历史版本可通过 Git 查看。旧方向绘图已迁至 `viz.plot_population_direction`，关联绘图也统一放入 `viz.py`。所有核心基因筛选只在 Layer0 完成。
+
+最终输入只读取 cNMF 的 `gene_spectra_score` 和 `usages`、H5AD 的 `.obs`、PAC 注释以及可选 wPSI/symbol map。H5AD 使用 backed 模式读取 metadata 后关闭文件，不加载整个计数矩阵。不再加载未使用的 TPM、PSI 和旧模块来源表。`load_wpsi` 直接返回 DataFrame 或 None；其余各层的结果字段和统计阈值保持一致。
 
 Python 接口：
 
@@ -107,4 +129,4 @@ Notebook 还在各层目录中生成图。`status: completed` 表示调度完成
 python -m unittest discover -s tests -v
 ```
 
-测试使用确定性合成数据和模拟 API，覆盖阈值边界、PAC 聚合、检测率保留、显式背景协议、AUC 正负与同分、usage 反向时的一致性、样本不足、缺失输入、结果整合和导出。真实数据未提供，真实数据的全量结论不属于这些测试的验证范围。
+测试使用确定性合成数据和模拟 API，覆盖阈值边界、PAC 聚合、检测率保留、显式背景协议、AUC 正负与同分、usage 反向时的一致性、样本不足、RDS 读写与条形码对齐、macOS 符号链接路径、缺失输入、结果整合和导出。真实数据未提供，真实数据的全量结论不属于这些测试的验证范围。
