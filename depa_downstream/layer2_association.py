@@ -104,7 +104,8 @@ def _build_label(meta: pd.DataFrame, contrast: dict) -> pd.Series:
         label = (meta.loc[mask, col] == contrast["group_b"]).astype(int)
         return label
     elif contrast["type"] == "one_vs_rest":
-        label = (meta[col] == contrast["group"]).astype(int)
+        # Unknown identities are not a biological "rest" group.
+        label = (meta.loc[meta[col].notna(), col] == contrast["group"]).astype(int)
         return label
     else:
         raise ValueError(f"未知 contrast type: {contrast['type']}（auto_one_vs_rest_all 应已在此之前展开）")
@@ -140,7 +141,7 @@ def compute_contrast_association(
     """
     usage = data["usage"]
     meta = data["meta"]
-    programs = data["programs"]
+    programs = list(usage.columns)
     min_cells = config.get("min_cells_per_group", 20)
 
     contrasts = _expand_contrasts(config["contrasts"], meta)
@@ -215,6 +216,7 @@ def compute_contrast_association(
         if _HAS_XGB:
             xgb = XGBClassifier(
                 n_estimators=100, max_depth=3, eval_metric="logloss", random_state=0,
+                n_jobs=config.get("xgb_n_jobs", 2),
             )
             xgb.fit(X, y)
             xgb_importances = dict(zip(programs, xgb.feature_importances_))
@@ -239,12 +241,68 @@ def compute_contrast_association(
         result_df = pd.DataFrame(rows).set_index("program")
         result_df = result_df.reindex(result_df["auc"].sub(0.5).abs().sort_values(ascending=False).index)
         result_df.attrs["category"] = category
+        result_df.attrs["contrast"] = dict(contrast)
         top_line = result_df["auc"].sub(0.5).abs().sort_values(ascending=False).head(1)
         print(f"  最强关联: {top_line.index[0]} (|AUC-0.5|={top_line.iloc[0]:.3f})")
 
         results[name] = result_df
 
     return results
+
+
+def resolve_disease_contrast(config: dict) -> dict | None:
+    """Select an explicit disease contrast; refuse ambiguous multiple diseases."""
+    requested = config.get('disease_contrast')
+    candidates = [c for c in config['contrasts'] if c['type'] == 'pairwise'
+                  and (c['name'] == requested if requested else _resolve_category(c) == 'disease')]
+    if requested and not candidates:
+        raise ValueError(f'disease_contrast {requested!r} is not a configured pairwise contrast')
+    if len(candidates) > 1:
+        raise ValueError('Multiple disease contrasts: set disease_contrast to a contrast name')
+    return candidates[0] if candidates else None
+
+
+def summarize_program_associations(assoc_results: dict, config: dict,
+                                   programs: list | None = None) -> pd.DataFrame:
+    """Select max |AUC-.5| cell identity per program, including depleted types.
+
+    Count the positive (identity) group, not its complement. Ties are resolved
+    by cell-type label for deterministic results. Only tested, finite AUCs
+    participate; no cell type is inferred from an untested contrast.
+    """
+    disease = resolve_disease_contrast(config)
+    if programs is None:
+        programs = list(dict.fromkeys(p for result in assoc_results.values()
+                                     if result is not None for p in result.index))
+    celltype_column = config['meta_columns']['celltype']
+    rows = []
+    for program in programs:
+        row = dict(program=program, disease_contrast=disease['name'] if disease else None,
+                   disease_auc=np.nan, best_celltype=None, best_celltype_auc=np.nan,
+                   best_celltype_n_cells=0, best_celltype_association=None,
+                   association_status='no_valid_identity')
+        disease_result = assoc_results.get(disease['name']) if disease else None
+        if disease_result is not None and program in disease_result.index:
+            row['disease_auc'] = disease_result.loc[program, 'auc']
+        candidates = []
+        for name, result in assoc_results.items():
+            if result is None or program not in result.index:
+                continue
+            contrast = result.attrs.get('contrast', {})
+            if contrast.get('column') != celltype_column or contrast.get('type') != 'one_vs_rest':
+                continue
+            auc = result.loc[program, 'auc']
+            if pd.notna(auc) and np.isfinite(auc):
+                candidates.append((abs(float(auc) - 0.5), str(contrast['group']), contrast['group'], result.loc[program]))
+        if candidates:
+            _, _, label, selected = sorted(candidates, key=lambda x: (-x[0], x[1]))[0]
+            row.update(best_celltype=label, best_celltype_auc=float(selected['auc']),
+                       best_celltype_n_cells=int(selected['n_group_b']),
+                       best_celltype_association=('enriched' if selected['auc'] > 0.5 else
+                                                  'depleted' if selected['auc'] < 0.5 else 'neutral'),
+                       association_status='ok')
+        rows.append(row)
+    return pd.DataFrame(rows).set_index('program')
 
 
 def plot_association_heatmap(assoc_results: dict, config: dict, out_dir: str) -> str:

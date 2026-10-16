@@ -39,7 +39,7 @@ REQUIRED_META_COLUMNS = ["sample", "celltype"]
 VALID_CONTRAST_TYPES = ["pairwise", "one_vs_rest", "auto_one_vs_rest_all"]
 
 # 可选字段一览（不校验存在性，只在这里留文档，方便回头查）：
-#   wpsi_matrix_path          — Layer 1 用，没有则 Layer 1 跳过并给出提示
+#   wpsi_matrix_path          — Layer 0 可靠性标注 / Layer 3 方向检验；不影响富集和 usage
 #   psi_matrix_path           — 同上
 #   depa_feature_source_path  — Layer 3 的 infer_program_modules 用，
 #                                没有则退回手动 MODULE_DEF
@@ -47,6 +47,11 @@ VALID_CONTRAST_TYPES = ["pairwise", "one_vs_rest", "auto_one_vs_rest_all"]
 #                                优先级低于 depa_feature_source_path 自动推断）
 #   z_threshold / top_n_pacs / min_cells_per_group / ... — 各层分析阈值，
 #                                缺失时每个函数使用自己的默认值
+#   spec_min_z / min_detection_rate — Layer 0 专属性和 wPSI 可靠性标注阈值
+#   disease_contrast          — 多个疾病 pairwise 对比时显式指定 Layer 3 使用的 name
+#   within_min_cells_per_group / within_effect_threshold / within_p_threshold
+#   within_significance       — "p"（默认）或 "padj"；BH 以每个 program 为一组
+#   direction_background_mode — "complement"（默认）或 "full_universe"
 
 
 class ConfigError(ValueError):

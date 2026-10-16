@@ -82,3 +82,12 @@ enrichr_cutoff_padj: 0.05
 diff_padj_cutoff: 0.05
 
 output_root: "outputs/covid_19/"
+
+# Layer0–3：共享身份表、组内检验与显式符号约定
+spec_min_z: 0.5
+min_detection_rate: 0.1
+min_fg_genes: 5
+direction_background_mode: complement
+within_effect_threshold: 0.01
+within_p_threshold: 0.05
+within_significance: p

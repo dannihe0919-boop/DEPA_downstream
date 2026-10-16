@@ -10,6 +10,36 @@ import os
 import numpy as np
 import pandas as pd
 
+
+def plot_within_celltype_concordance(gene_tables: dict, program: str, out_dir: str) -> str:
+    """Plot Layer 3b core-gene effects directly from the final Layer 0 table."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    from urllib.parse import quote
+
+    table = gene_tables[program]
+    selected = table.loc[table['is_core'] & table['within_celltype_mean_diff'].notna()].copy()
+    if selected.empty:
+        return ''
+    selected = selected.sort_values('within_celltype_mean_diff')
+    colors = {'concordant': '#55A868', 'discordant': '#C44E52', 'inconclusive': '#999999', 'not_tested': '#DDDDDD'}
+    fig, ax = plt.subplots(figsize=(7, max(3, len(selected) * .3)))
+    ax.barh(range(len(selected)), selected['within_celltype_mean_diff'],
+            color=[colors[label] for label in selected['concordance']])
+    ax.set_yticks(range(len(selected)), labels=selected['symbol'])
+    ax.axvline(0, color='black', linewidth=.8)
+    ax.set_xlabel('Mean wPSI difference (disease group B − group A)')
+    celltype = selected['within_celltype'].iloc[0]
+    expected = selected['within_celltype_expected_direction'].iloc[0]
+    ax.set_title(f'{program} within {celltype}; expected B−A: {expected}')
+    ax.legend(handles=[Patch(facecolor=color, label=label) for label, color in colors.items()], fontsize=8)
+    fig.tight_layout()
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f'layer3_within_celltype_{quote(str(program), safe="")}.png')
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    return path
+
 def plot_gene_wpsi_by_group(
     gene_id: str,
     data: dict,
@@ -292,6 +322,13 @@ def plot_enrichment_bubble(
     labels = list(dict.fromkeys(plot_df["label"]))
 
     plot_df["neglog10_padj"] = -np.log10(plot_df["padj"].clip(lower=1e-300))
+    # Custom small backgrounds can legitimately yield infinite Enrichr
+    # combined scores. Matplotlib otherwise masks those hits entirely.
+    scores = pd.to_numeric(plot_df['combined_score'], errors='coerce')
+    finite = scores[np.isfinite(scores)]
+    upper = max(1.0, float(finite.max())) if len(finite) else 1.0
+    lower = min(0.0, float(finite.min())) if len(finite) else 0.0
+    display_scores = scores.replace({np.inf: upper, -np.inf: lower}).fillna(lower)
     y_pos = {t: i for i, t in enumerate(term_order)}
     x_pos = {l: i for i, l in enumerate(labels)}
 
@@ -300,7 +337,7 @@ def plot_enrichment_bubble(
         [x_pos[l] for l in plot_df["label"]],
         [y_pos[t] for t in plot_df["term_short"]],
         s=plot_df["neglog10_padj"] * 30,
-        c=plot_df["combined_score"],
+        c=display_scores,
         cmap="Reds",
         edgecolors="black",
         linewidths=0.5,
@@ -311,6 +348,8 @@ def plot_enrichment_bubble(
     ax.set_yticks(range(len(term_order)))
     ax.set_yticklabels(term_order, fontsize=8)
     ax.set_title(f"Top enriched terms (padj < {padj_threshold})")
+    if not np.isfinite(scores).all():
+        ax.set_title(ax.get_title() + '\n(non-finite scores shown at color limits)')
     fig.colorbar(sc, ax=ax, label="combined score", fraction=0.04, pad=0.08)
 
     for size_val, label_txt in [(2, "padj=1e-2"), (5, "padj=1e-5")]:

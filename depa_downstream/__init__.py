@@ -1,4 +1,9 @@
 from .config_schema import validate_config, ConfigError
+from .layer0_identity import build_program_gene_tables, pac_universe
+from .layer1_enrichment import run_functional_enrichment
+from .layer2_association import summarize_program_associations
+from .layer3_direction import compute_population_direction, annotate_within_celltype
+from .integration import integrate_results
 from .io_layer import load_cnmf_outputs, load_wpsi_psi, load_depa_feature_source, load_gene_symbol_map
 from .layer1_direction import (
     compute_program_direction,
@@ -26,6 +31,7 @@ from .layer3_markers import (
     resolve_module_labels,
 )
 from .viz import (
+    plot_within_celltype_concordance,
     plot_jaccard_heatmap,
     plot_enrichment_bubble,
     plot_leading_genes_bar,
@@ -38,9 +44,12 @@ from .viz import (
 )
 
 __all__ = [
+    "build_program_gene_tables", "pac_universe", "run_functional_enrichment",
+    "summarize_program_associations", "compute_population_direction", "annotate_within_celltype", "integrate_results",
+    "plot_within_celltype_concordance",
     "validate_config", "ConfigError",
     "load_cnmf_outputs", "load_wpsi_psi", "load_depa_feature_source", "load_gene_symbol_map",
-    "compute_program_direction", "plot_program_direction_summary", "compute_leading_genes",
+    "compute_program_direction", "plot_program_direction_summary", "compute_leading_genes", "compute_foreground_gene_directions",
     "compute_usage_binned_wpsi","subset_data_to_celltype",
     "compare_within_celltype", "summarize_leading_gene_within_celltype",
     "compute_contrast_association", "plot_association_heatmap", "plot_program_umap_grid",

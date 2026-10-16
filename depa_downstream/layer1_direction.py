@@ -323,6 +323,7 @@ def plot_program_direction_summary(
     out_dir: str,
     padj_threshold: float = 0.05,
     pval_threshold: float = 0.05,
+    filename: str = "layer1_program_direction_summary.png",
 ) -> str:
     """画方向检验的汇总条形图（delta_median，按方向着色，标注显著性）。
 
@@ -389,7 +390,7 @@ def plot_program_direction_summary(
                  va="center", ha=ha, fontsize=8)
 
     fig.tight_layout()
-    out_path = os.path.join(out_dir, "layer1_program_direction_summary.png")
+    out_path = os.path.join(out_dir, filename)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     print(f"  已保存: {out_path}")
