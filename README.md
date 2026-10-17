@@ -131,24 +131,32 @@ python -m unittest discover -s tests -v
 
 测试使用确定性合成数据和模拟 API，覆盖阈值边界、PAC 聚合、检测率保留、显式背景协议、AUC 正负与同分、usage 反向时的一致性、样本不足、RDS 读写与条形码对齐、macOS 符号链接路径、缺失输入、结果整合和导出。真实数据未提供，真实数据的全量结论不属于这些测试的验证范围。
 
-### P02 报告补充
+### Program 报告补充
 
-在仓库根目录运行 `PreT_analysis.ipynb` 的最后一个单元，或在完成 Layer3 后运行：
+专项报告统一放在 `depa_downstream/program_report.py`，通过 `program` 参数复用，
+不在项目根目录为 P02/P04 等分别创建脚本。Notebook 只保留数据配置与函数调用，
+分析代码放包内，图表和表格保存到 `analysis_results/`。
+
+在完成 Layer3 后运行（PreT Notebook 的最后一个单元已接入）：
 
 ```python
-from p02_report import generate_p02_report
-p02_report = generate_p02_report(
+from depa_downstream.program_report import generate_program_report
+p02_report = generate_program_report(
     data, CONFIG, gene_tables, association_summary, population_direction,
-    output_dir=OUTPUT_ROOT / 'layer3', enrichment=enrichment,
+    program='P02', output_dir=OUTPUT_ROOT / 'layer3', enrichment=enrichment,
 )
 ```
 
-根目录脚本 `p02_report.py` 复用既有身份与分组，不联网、不修改共享基因表。
-所有文件以 `P02_` 开头，保存到之前的 `layer3`；同名补充文件重复运行时更新。
-图 A–G 分别展示 usage、整体偏好、组内基因长短变化、关键基因分布、样本均值、
-usage–wPSI 分箱趋势，以及既有富集 term 的长短基因命中数；图 G 仅在存在显著富集时生成。
-每图提供 300 dpi PNG、PDF、SVG。逐基因与逐样本统计、分箱数据和图注另存 CSV/JSON/Markdown。
-主图默认使用 BH q<0.05 且 |ΔwPSI|≥0.01，CSV 同时保留原始 p 分类；设置
+改为 `program='P04'` 即可复用；`key_genes=[...]` 可指定展示基因，完整统计始终包含
+所选程序的全部核心基因。P02 有默认候选基因，其他程序未指定时按权重选前八个核心基因。
+根目录旧文件 `p02_report.py` 已移除；本地旧文件可留待手动清理，不再导入。
+
+所有文件以 program 编号开头，如 `P02_`、`P04_`，保存到之前的 `layer3`；
+同名补充文件重复运行时更新。图 A–G 分别展示 usage、整体偏好、组内基因长短变化、
+关键基因分布、样本均值、usage–wPSI 分箱趋势，以及既有富集 term 的长短基因命中数；
+图 G 仅在存在显著富集时生成。每图提供 300 dpi PNG、PDF、SVG。
+逐基因与逐样本统计、分箱数据和图注另存 CSV/JSON/Markdown。
+主图默认使用程序内 BH q<0.05 且 |ΔwPSI|≥0.01，CSV 同时保留原始 p 分类；设置
 `significance='p'` 可展示原始 p 的探索性分类。所有差值固定为疾病组 B−A，偏短为蓝、偏长为橙。
 必须确认上游 wPSI 越大是否表示远端偏好，且未检出值没有被填成 0。
 样本检验比较独立样本均值，两组至少各两个合格样本；sample ID 不能自动视为独立患者。

@@ -1,4 +1,4 @@
-"""P02 supplement: direct length signs, zero handling and sample inference."""
+"""Program report: direct length signs, zero handling and sample inference."""
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,12 +8,30 @@ import pandas as pd
 
 from depa_downstream import (build_program_gene_tables, compute_contrast_association,
                              summarize_program_associations, compute_population_direction)
-from p02_report import generate_p02_report, _preference
+from depa_downstream.program_report import generate_program_report, _preference
 from test_workflow import fixture, FakeEnrichr
 from depa_downstream import run_functional_enrichment
 
 
-class P02ReportTests(unittest.TestCase):
+class ProgramReportTests(unittest.TestCase):
+    def test_another_program_uses_its_own_genes_labels_and_output_prefix(self):
+        data, config = fixture()
+        tables = build_program_gene_tables(data, config)
+        associations = compute_contrast_association(data, config)
+        summary = summarize_program_associations(associations, config, programs=list(tables))
+        directions = compute_population_direction(tables, config)
+        with tempfile.TemporaryDirectory() as directory:
+            result = generate_program_report(data, config, tables, summary, directions,
+                program='P01', output_dir=directory, key_genes=['G00'], formats=('svg',))
+            self.assertEqual(result['summary']['program'], 'P01')
+            self.assertEqual(set(result['genes'].gene_id), {f'G{i:02}' for i in range(6)})
+            self.assertEqual(result['key_genes'].gene_id.tolist(), ['G00'])
+            self.assertTrue((Path(directory)/'P01_report_summary.json').is_file())
+            self.assertTrue((Path(directory)/'P01_core_gene_statistics.csv').is_file())
+            self.assertFalse(list(Path(directory).glob('P02_*')))
+            self.assertTrue(all(Path(path).name.startswith('P01_')
+                                for paths in result['figures'].values() for path in paths))
+
     def test_length_labels_use_actual_wpsi_sign_and_selected_significance(self):
         delta = pd.Series([.1, -.1, .001, .1, -.1])
         raw_p = pd.Series([.01, .01, .001, .04, np.nan])
@@ -38,7 +56,7 @@ class P02ReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sentinel = Path(directory) / 'population_direction.csv'
             sentinel.write_text('existing results')
-            report = generate_p02_report(data, config, tables, summary, directions,
+            report = generate_program_report(data, config, tables, summary, directions,
                 output_dir=directory, key_genes=['G06', 'G07', 'G08', 'G09'],
                 min_cells_per_sample=5, enrichment=enrichment, formats=('png', 'pdf', 'svg'))
             genes = report['genes'].set_index('gene_id')
@@ -75,7 +93,7 @@ class P02ReportTests(unittest.TestCase):
         summary = summarize_program_associations(associations, config, programs=list(tables))
         directions = compute_population_direction(tables, config)
         with tempfile.TemporaryDirectory() as directory:
-            result = generate_p02_report(data, config, tables, summary, directions,
+            result = generate_program_report(data, config, tables, summary, directions,
                 output_dir=directory, key_genes=['G06'], formats=('svg',))
         self.assertTrue(result['genes'].sample_status.eq('missing_sample_metadata').all())
         self.assertTrue(result['genes'].sample_p.isna().all())

@@ -1,4 +1,4 @@
-"""P02 report supplement. Run from the repository-root Notebook after Layer 3.
+"""Reusable per-program report supplement. Run from a Notebook after Layer 3.
 
 No network queries; no changes to the shared Layer 0 tables. All wPSI values,
 including 0 and 1, are retained. NaN is never replaced by zero.
@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import textwrap
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -17,8 +18,8 @@ from statsmodels.stats.multitest import multipletests
 from depa_downstream.layer2_association import resolve_disease_contrast
 from depa_downstream.layer3_direction import annotate_within_celltype
 
-DEFAULT_GENES = ['CENPM', 'NAP1L1', 'TPX2', 'MPC1', 'SOX4', 'STMN1',
-                 'PTP4A2', 'PCLAF', 'HNRNPA1', 'HNRNPA0', 'CACYBP', 'PSIP1']
+DEFAULT_KEY_GENES = {'P02': ['CENPM', 'NAP1L1', 'TPX2', 'MPC1', 'SOX4', 'STMN1',
+                 'PTP4A2', 'PCLAF', 'HNRNPA1', 'HNRNPA0', 'CACYBP', 'PSIP1']}
 COLORS = {'shorter': '#3575AD', 'longer': '#DE8744',
           'inconclusive': '#A5A5A5', 'not_tested': '#DDDDDD'}
 GROUP_COLORS = ['#526A91', '#B64852']
@@ -42,16 +43,16 @@ def _preference(delta, p, eligible, alpha, effect):
     return result
 
 
-def generate_p02_report(data, config, gene_tables, association_summary,
-                        population_direction, *, output_dir=None, key_genes=None,
+def generate_program_report(data, config, gene_tables, association_summary,
+                        population_direction, *, program='P02', output_dir=None, key_genes=None,
                         enrichment=None,
                         significance='padj', alpha=0.05, effect_threshold=0.01,
                         min_cells_per_sample=10, n_bins=5, formats=('png', 'pdf', 'svg')):
-    """Export P02 tables and figures into the existing layer3 directory.
+    """Export one program's tables and figures into the existing layer3 directory.
 
     Reuse Layer 0 core membership and Layer 2 selected cell type. Recompute only
-    P02's within-cell-type statistics on a copy to avoid stale Notebook outputs.
-    Main plot defaults to within-P02 BH q<.05, |mean B-A|>=.01; raw-p labels and
+    the selected program's within-cell-type statistics on a copy to avoid stale Notebook outputs.
+    Main plot defaults to within-program BH q<.05, |mean B-A|>=.01; raw-p labels and
     original Layer 3 concordance are also exported. Sample-level tests compare
     unpaired sample means, with at least two usable samples in each group.
 
@@ -62,6 +63,9 @@ def generate_p02_report(data, config, gene_tables, association_summary,
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
+    if not isinstance(program, str) or not program.strip():
+        raise ValueError('program must be a nonempty string')
+    prefix = quote(program, safe='')
     if significance not in ('p', 'padj') or not 0 < alpha < 1:
         raise ValueError('Use significance=p or padj and 0<alpha<1')
     if (not np.isfinite(effect_threshold) or effect_threshold < 0
@@ -69,16 +73,16 @@ def generate_p02_report(data, config, gene_tables, association_summary,
         raise ValueError('Invalid effect, sample-cell or bin threshold')
     if not formats or set(formats) - {'png', 'pdf', 'svg'}:
         raise ValueError('formats must contain png, pdf and/or svg')
-    if 'P02' not in gene_tables or 'P02' not in data['usage']:
-        raise ValueError('P02 is missing from gene tables or usage')
+    if program not in gene_tables or program not in data['usage']:
+        raise ValueError(f'{program} is missing from gene tables or usage')
     if data.get('wpsi') is None:
         raise ValueError('wPSI is required; no values will be imputed')
     disease = resolve_disease_contrast(config)
     if disease is None:
         raise ValueError('A disease contrast with group_a/group_b is required')
-    celltype = association_summary.loc['P02', 'best_celltype']
+    celltype = association_summary.loc[program, 'best_celltype']
     if pd.isna(celltype):
-        raise ValueError('Layer 2 has no selected P02 cell type')
+        raise ValueError(f'Layer 2 has no selected {program} cell type')
     a, b, group_col = disease['group_a'], disease['group_b'], disease['column']
     type_col = config['meta_columns']['celltype']
     sample_col = config['meta_columns'].get('sample')
@@ -87,7 +91,7 @@ def generate_p02_report(data, config, gene_tables, association_summary,
     subset = subset.loc[subset.index.intersection(data['wpsi'].columns)]
     if not all(subset[group_col].eq(g).any() for g in (a, b)):
         raise ValueError('Both disease groups must occur inside the selected cell type')
-    ids = gene_tables['P02']['gene_id']
+    ids = gene_tables[program]['gene_id']
     if ids.duplicated().any():
         raise ValueError('Layer 0 gene IDs must be unique')
     matrix = data['wpsi'].reindex(index=ids, columns=subset.index).replace([np.inf, -np.inf], np.nan)
@@ -95,11 +99,11 @@ def generate_p02_report(data, config, gene_tables, association_summary,
     if finite.size and ((finite < 0).any() or (finite > 1).any()):
         raise ValueError('Expected wPSI in [0,1]; check the upstream definition')
 
-    tables = annotate_within_celltype({'P02': gene_tables['P02']}, data, config,
+    tables = annotate_within_celltype({program: gene_tables[program]}, data, config,
                                      association_summary, population_direction, inplace=False)
-    genes = tables['P02'].loc[lambda t: t['is_core']].copy().reset_index(drop=True)
+    genes = tables[program].loc[lambda t: t['is_core']].copy().reset_index(drop=True)
     if genes.empty:
-        raise ValueError('P02 has no Layer 0 core genes')
+        raise ValueError(f'{program} has no Layer 0 core genes')
     eligible = genes.within_celltype_status.isin(['tested', 'unknown_expected_direction'])
     # Also supports the earlier Layer3 module when this file is downloaded alone.
     # An undefined population expectation must not prevent a direct B-A analysis.
@@ -116,12 +120,12 @@ def generate_p02_report(data, config, gene_tables, association_summary,
         eligible, alpha, effect_threshold)
     genes['report_length_preference'] = genes['report_length_preference_bh' if significance == 'padj'
                                              else 'report_length_preference_raw_p']
-    genes['pooled_delta_from_background'] = genes.gene_wpsi_median - population_direction.loc['P02', 'bg_median']
+    genes['pooled_delta_from_background'] = genes.gene_wpsi_median - population_direction.loc[program, 'bg_median']
     # Explicitly named interior fraction: it is NOT an expression-detection rate.
     genes['wpsi_interior_fraction_a'] = genes.within_celltype_detection_rate_a
     genes['wpsi_interior_fraction_b'] = genes.within_celltype_detection_rate_b
 
-    usage = data['usage']['P02'].reindex(subset.index).replace([np.inf, -np.inf], np.nan)
+    usage = data['usage'][program].reindex(subset.index).replace([np.inf, -np.inf], np.nan)
     sample_rows, usage_rows, bin_rows, corr_rows = [], [], [], []
     has_samples = sample_col is not None and sample_col in subset
     sample_groups = (list(subset.dropna(subset=[sample_col]).groupby([group_col, sample_col], observed=True))
@@ -196,7 +200,7 @@ def generate_p02_report(data, config, gene_tables, association_summary,
                                                'usage_bin', 'n_cells', 'usage_mean', 'wpsi_mean'])
     usage_table = pd.DataFrame(usage_rows)
     corr_table = pd.DataFrame(corr_rows)
-    requested = list(dict.fromkeys(DEFAULT_GENES if key_genes is None else key_genes))
+    requested = list(dict.fromkeys(DEFAULT_KEY_GENES.get(program, []) if key_genes is None else key_genes))
     selected = genes.loc[genes.symbol.isin(requested)].copy()
     if selected.empty:
         selected = genes.head(8).copy()  # Fixed weight ranking, not significance selection.
@@ -216,7 +220,7 @@ def generate_p02_report(data, config, gene_tables, association_summary,
     def save(fig, name):
         paths = []
         for extension in formats:
-            path = out / f'P02_{name}.{extension}'
+            path = out / f'{prefix}_{name}.{extension}'
             fig.savefig(path, dpi=300, bbox_inches='tight', facecolor='white')
             paths.append(str(path))
         plt.close(fig)
@@ -239,13 +243,13 @@ def generate_p02_report(data, config, gene_tables, association_summary,
             mask = valid & meta[type_col].eq(celltype)
             axes[0, 0].scatter(xy.loc[mask].iloc[:, 0], xy.loc[mask].iloc[:, 1], s=3, c='#526A91', rasterized=True)
             axes[0, 0].set_title(str(celltype))
-            uv = data['usage']['P02'].reindex(meta.index)
+            uv = data['usage'][program].reindex(meta.index)
             mask = valid & uv.notna()
             cells = uv.loc[mask].sort_values().index
             sc = axes[0, 1].scatter(xy.loc[cells].iloc[:, 0], xy.loc[cells].iloc[:, 1], c=uv.loc[cells],
                                     s=3, cmap='viridis', rasterized=True)
-            fig.colorbar(sc, ax=axes[0, 1], label='P02 usage', fraction=.04)
-            axes[0, 1].set_title('P02 usage (all cells)')
+            fig.colorbar(sc, ax=axes[0, 1], label=f'{program} usage', fraction=.04)
+            axes[0, 1].set_title(f'{program} usage (all cells)')
         ua, ub = [usage.loc[subset[group_col].eq(g)].dropna() for g in (a, b)]
         box = ax.boxplot([ua, ub], patch_artist=True, showfliers=False)
         for patch, color in zip(box['boxes'], GROUP_COLORS):
@@ -256,7 +260,7 @@ def generate_p02_report(data, config, gene_tables, association_summary,
             vals = su.loc[su.group.eq(group), 'usage_mean'].dropna()
             ax.scatter(i + np.linspace(-.08, .08, len(vals)), vals, color=color, edgecolor='white', s=45, zorder=3)
         auc = mannwhitneyu(ub, ua, alternative='two-sided').statistic / (len(ua) * len(ub)) if len(ua) and len(ub) else np.nan
-        ax.set(xticks=[1, 2], xticklabels=[f'{a}\nn={len(ua)}', f'{b}\nn={len(ub)}'], ylabel='P02 usage',
+        ax.set(xticks=[1, 2], xticklabels=[f'{a}\nn={len(ua)}', f'{b}\nn={len(ub)}'], ylabel=f'{program} usage',
                title=f'Within selected cell type\nAUC(B vs A)={auc:.3f}; dots: sample means')
         fig.tight_layout()
         save(fig, 'A_identity_usage')
@@ -264,7 +268,7 @@ def generate_p02_report(data, config, gene_tables, association_summary,
         # B. Pooled absolute preference is kept separate from disease change.
         ordered = genes.sort_values(['gene_wpsi_median', 'gene_id'], na_position='last')
         fig, ax = plt.subplots(figsize=(7, max(4, .24 * len(ordered))))
-        bg = population_direction.loc['P02', 'bg_median']
+        bg = population_direction.loc[program, 'bg_median']
         for y, row in enumerate(ordered.itertuples()):
             marker = '*' if row.is_specific else 'o'
             reliable = pd.notna(row.is_wpsi_reliable) and bool(row.is_wpsi_reliable)
@@ -355,7 +359,7 @@ def generate_p02_report(data, config, gene_tables, association_summary,
                         avg = sub.groupby('usage_bin', observed=True)[['usage_mean', 'wpsi_mean']].mean()
                         if not avg.empty:
                             ax.plot(avg.usage_mean, avg.wpsi_mean, '-o', c=color, ms=4, label=str(group))
-                    ax.set(xlabel='P02 usage (shared quantile bins)', ylabel='Mean wPSI', ylim=(-.03, 1.03),
+                    ax.set(xlabel=f'{program} usage (shared quantile bins)', ylabel='Mean wPSI', ylim=(-.03, 1.03),
                            title=f'{row.plot_label}\nThin: samples; thick: equal-sample mean')
                     if ax.get_legend_handles_labels()[0]:
                         ax.legend(fontsize=7)
@@ -370,7 +374,7 @@ def generate_p02_report(data, config, gene_tables, association_summary,
         overlap_rows = []
         symbol_groups = {label: set(genes.loc[genes.report_length_preference.eq(label), 'symbol'].str.upper())
                          for label in COLORS}
-        for kind, terms in (enrichment or {}).get('P02', {}).items():
+        for kind, terms in (enrichment or {}).get(program, {}).items():
             if terms is None or terms.empty:
                 continue
             for term in terms.itertuples():
@@ -415,16 +419,16 @@ def generate_p02_report(data, config, gene_tables, association_summary,
                 fig.tight_layout()
                 save(fig, 'G_enrichment_length_overlap')
 
-    summary = dict(program='P02', celltype=celltype, group_a=a, group_b=b,
-                   association=association_summary.loc['P02'].to_dict(),
-                   population_direction=population_direction.loc['P02'].to_dict(),
+    summary = dict(program=program, celltype=celltype, group_a=a, group_b=b,
+                   association=association_summary.loc[program].to_dict(),
+                   population_direction=population_direction.loc[program].to_dict(),
                    cell_counts=subset[group_col].value_counts().to_dict(),
                    n_core=len(genes), classification_counts=genes.report_length_preference.value_counts().to_dict(),
                    raw_p_counts=genes.report_length_preference_raw_p.value_counts().to_dict(),
                    bh_counts=genes.report_length_preference_bh.value_counts().to_dict(),
                    significance=significance, alpha=alpha, effect_threshold=effect_threshold,
                    min_cells_per_sample=min_cells_per_sample, n_bins=n_bins,
-                   sample_tests='unpaired MWU on eligible sample means; BH across P02 core genes',
+                   sample_tests='unpaired MWU on eligible sample means; BH across selected program core genes',
                    enrichment_overlap_status='annotated' if not overlap_table.empty else 'no_existing_terms',
                    missing_sample_labels=int(subset[sample_col].isna().sum()) if has_samples else len(subset),
                    requested_genes=requested, unavailable_key_genes=[g for g in requested if g not in set(genes.symbol)],
@@ -436,7 +440,7 @@ def generate_p02_report(data, config, gene_tables, association_summary,
                         ('sample_wpsi', sample_table), ('usage_statistics', usage_table),
                         ('usage_wpsi_bins', bin_table), ('within_group_correlations', corr_table),
                         ('enrichment_length_overlap', overlap_table)]:
-        table.to_csv(out / f'P02_{name}.csv', index=False, encoding='utf-8-sig')
+        table.to_csv(out / f'{prefix}_{name}.csv', index=False, encoding='utf-8-sig')
     # Convert NaN/Inf to JSON null, preserving numeric fields.
     def clean(value):
         if isinstance(value, dict):
@@ -450,35 +454,35 @@ def generate_p02_report(data, config, gene_tables, association_summary,
         if value is pd.NA:
             return None
         return value
-    (out / 'P02_report_summary.json').write_text(json.dumps(clean(summary), indent=2, ensure_ascii=False, allow_nan=False) + '\n')
-    (out / 'P02_figure_notes.md').write_text(textwrap.dedent(f'''\
-        # P02 报告图说明
+    (out / f'{prefix}_report_summary.json').write_text(json.dumps(clean(summary), indent=2, ensure_ascii=False, allow_nan=False) + '\n')
+    (out / f'{prefix}_figure_notes.md').write_text(textwrap.dedent(f'''\
+        # {program} 报告图说明
 
         比较范围：{celltype}；A={a}，B={b}。ΔwPSI 固定为 B−A。
         wPSI 增大解释为远端/较长 3′UTR 偏好；需核对上游定义及零值编码。
         变化大小不是 3′UTR 长度变化百分比，也不是表达量变化。
 
-        - A：全部细胞上的 P02 分布与所选细胞群内 usage。箱线图使用全部有效细胞，隐藏离群点；散点为样本均值。
+        - A：全部细胞上的 {program} 分布与所选细胞群内 usage。箱线图使用全部有效细胞，隐藏离群点；散点为样本均值。
         - B：各核心基因跨细胞的 wPSI 中位数与背景中位数。星号为专属 marker；这是基因间比较，不是疾病差异。
         - C：同一细胞群内各核心基因两组 wPSI 均值与 B−A。蓝=偏短，橙=偏长，灰=不确定，浅灰=未完成检验。
         - D：关键基因经验累积分布，保留零值和一值，不作平滑；虚线为均值。
         - E：每点为一个样本的平均 wPSI；空心点表示有效细胞少于 {min_cells_per_sample}，不参加样本检验。
-          黑线为合格样本均值的等权平均；样本检验为非配对 MWU，两组各至少两个合格样本，并在 P02 内做 BH 校正。
+          黑线为合格样本均值的等权平均；样本检验为非配对 MWU，两组各至少两个合格样本，并在 {program} 内做 BH 校正。
           同一样本 ID 跨两组时不执行非配对检验。sample 可能代表文库，不能自动视作独立患者。
-        - F：P02 usage 的共享分位数区间内，分别展示两组的 wPSI。细线=样本，粗线=样本均值等权平均。
+        - F：{program} usage 的共享分位数区间内，分别展示两组的 wPSI。细线=样本，粗线=样本均值等权平均。
           每样本每区间至少 {min_cells_per_sample} 个有效细胞。曲线仅作描述，不保证单调，不作为独立因果证据。
         - G（存在显著富集结果时）：复用 Layer1 term 的命中基因，标注其中偏短、偏长或不确定的数量。
           此图没有对长短基因子集重新富集，不能用来宣称某一子集独立显著富集。
 
         主图分类使用 {significance}<{alpha} 且 |ΔwPSI|≥{effect_threshold}。
-        CSV 同时保留原始 p、P02 内 BH q、两种长短分类和原 Layer3 concordance，互不覆盖。
+        CSV 同时保留原始 p、{program} 内 BH q、两种长短分类和原 Layer3 concordance，互不覆盖。
         所有细胞均值纳入有效的 0 和 1，NaN 不填零；两组细胞不要求同时具有 usage 才参加 wPSI 检验。
         wpsi_interior_fraction 是 0<wPSI<1 的比例，不代表基因表达检出率。
         缺失样本标签的细胞仍参加细胞分析，但不参加样本分析。
         如仅细胞级显著、样本级不显著，不能据此宣称跨患者重复成立。
         关键基因为预先指定列表，不按显著性挑选；缺失于核心集的基因记录在 summary JSON。
         本补充分析不重新查询富集、不覆盖 Layer0、不覆盖既有 Layer3 文件。
-        同名 P02_ 文件在重复运行时会更新。
+        同名 {prefix}_ 文件在重复运行时会更新。
         '''), encoding='utf-8')
     return dict(genes=genes, key_genes=selected, sample_wpsi=sample_table,
                 usage=usage_table, usage_bins=bin_table, correlations=corr_table,
