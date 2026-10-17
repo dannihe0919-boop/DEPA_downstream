@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import textwrap
+import warnings
 from urllib.parse import quote
 
 import numpy as np
@@ -43,11 +44,87 @@ def _preference(delta, p, eligible, alpha, effect):
     return result
 
 
+def _audit_wpsi_range(matrix, gene_table, output_dir, prefix, tolerance):
+    """Audit without changing any values; export counts and up to 1000 examples.
+
+    Noncore cell-level values are not consumed by the within-program report.
+    Cached medians displayed for core genes or used as reliable population
+    background are audited separately.
+    """
+    if not np.isfinite(tolerance) or not 0 <= tolerance <= 1e-4:
+        raise ValueError('wpsi_tolerance must be finite and between 0 and 1e-4')
+    array = matrix.to_numpy(dtype=float)
+    finite = np.isfinite(array)
+    strict = finite & ((array < 0) | (array > 1))
+    material = finite & ((array < -tolerance) | (array > 1 + tolerance))
+    lookup = gene_table.set_index('gene_id').reindex(matrix.index)
+    core = lookup.is_core.fillna(False).to_numpy(dtype=bool)
+    reliable = lookup.is_wpsi_reliable.fillna(False).to_numpy(dtype=bool)
+    medians = lookup.gene_wpsi_median.to_numpy(dtype=float)
+    bad_cached = (core | reliable) & np.isfinite(medians) & ((medians < -tolerance) | (medians > 1 + tolerance))
+    per_gene = pd.DataFrame({
+        'gene_id': matrix.index, 'symbol': lookup.symbol.to_numpy(), 'is_core': core,
+        'n_finite': finite.sum(axis=1), 'n_missing_or_nonfinite': (~finite).sum(axis=1),
+        'minimum': matrix.min(axis=1).to_numpy(), 'maximum': matrix.max(axis=1).to_numpy(),
+        'n_strict_outside_0_1': strict.sum(axis=1),
+        'n_outside_tolerance': material.sum(axis=1),
+        'cached_population_median': medians,
+        'cached_population_median_outside_tolerance': bad_cached,
+    })
+    ii, jj = np.nonzero(strict)
+    written = min(len(ii), 1000)
+    examples = pd.DataFrame({
+        'gene_id': matrix.index.to_numpy()[ii[:written]],
+        'symbol': lookup.symbol.to_numpy()[ii[:written]],
+        'is_core': core[ii[:written]],
+        'cell_id': matrix.columns.to_numpy()[jj[:written]],
+        'wpsi': array[ii[:written], jj[:written]],
+        'outside_tolerance': material[ii[:written], jj[:written]],
+    })
+    values = array[finite]
+    summary = dict(
+        tolerance=tolerance, minimum=float(values.min()) if len(values) else None,
+        maximum=float(values.max()) if len(values) else None,
+        n_finite=int(finite.sum()), n_strict_outside_0_1=int(strict.sum()),
+        n_outside_tolerance=int(material.sum()),
+        n_core_outside_tolerance=int(material[core].sum()),
+        n_noncore_outside_tolerance=int(material[~core].sum()),
+        n_used_cached_medians_outside_tolerance=int(bad_cached.sum()),
+        examples_written=written, values_modified=False,
+    )
+    blocked = summary['n_core_outside_tolerance'] > 0 or bad_cached.any()
+    summary['status'] = ('blocked_material_outliers' if blocked else
+                         'noncore_outliers_only' if material.any() else
+                         'within_floating_tolerance' if strict.any() else 'within_range')
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    per_gene.to_csv(out / f'{prefix}_wpsi_range_by_gene.csv', index=False, encoding='utf-8-sig')
+    examples.to_csv(out / f'{prefix}_wpsi_range_examples.csv', index=False, encoding='utf-8-sig')
+    (out / f'{prefix}_wpsi_range_summary.json').write_text(
+        json.dumps(summary, indent=2, allow_nan=False) + '\n', encoding='utf-8')
+    if blocked:
+        raise ValueError(
+            f'wPSI range audit: min={summary["minimum"]}, max={summary["maximum"]}; '
+            f'{summary["n_core_outside_tolerance"]} core-gene values and '
+            f'{summary["n_used_cached_medians_outside_tolerance"]} cached medians used by the report '
+            f'exceed [0,1] by more than {tolerance}. No values were clipped or rescaled. '
+            f'Diagnostics saved to {out / (prefix + "_wpsi_range_summary.json")} '
+            f'and {prefix}_wpsi_range_by_gene.csv / {prefix}_wpsi_range_examples.csv. '
+            'Check the upstream scale/missing-value encoding; do not automatically divide by 100.')
+    if strict.any():
+        warnings.warn(
+            f'{prefix}: wPSI audit status={summary["status"]}; '
+            f'min={summary["minimum"]}, max={summary["maximum"]}. '
+            'Original values retained; see range diagnostic files.', UserWarning, stacklevel=2)
+    return summary
+
+
 def generate_program_report(data, config, gene_tables, association_summary,
                         population_direction, *, program='P02', output_dir=None, key_genes=None,
                         enrichment=None,
                         significance='padj', alpha=0.05, effect_threshold=0.01,
-                        min_cells_per_sample=10, n_bins=5, formats=('png', 'pdf', 'svg')):
+                        min_cells_per_sample=10, n_bins=5, formats=('png', 'pdf', 'svg'),
+                        wpsi_tolerance=1e-6):
     """Export one program's tables and figures into the existing layer3 directory.
 
     Reuse Layer 0 core membership and Layer 2 selected cell type. Recompute only
@@ -59,6 +136,9 @@ def generate_program_report(data, config, gene_tables, association_summary,
     Return a dict with DataFrames, summary metadata and saved figure paths.
     This function assumes increasing wPSI means distal/longer 3'UTR preference;
     confirm this and the upstream meaning of zero before biological reporting.
+    Boundary deviations <= wpsi_tolerance are retained, not clipped. Material
+    core-gene or used cached-median outliers stop the report after exporting
+    diagnostic files. Noncore cell-level outliers are recorded separately.
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
@@ -94,10 +174,9 @@ def generate_program_report(data, config, gene_tables, association_summary,
     ids = gene_tables[program]['gene_id']
     if ids.duplicated().any():
         raise ValueError('Layer 0 gene IDs must be unique')
+    out = Path(output_dir if output_dir is not None else Path(config['output_root']) / 'layer3')
     matrix = data['wpsi'].reindex(index=ids, columns=subset.index).replace([np.inf, -np.inf], np.nan)
-    finite = matrix.to_numpy()[np.isfinite(matrix.to_numpy())]
-    if finite.size and ((finite < 0).any() or (finite > 1).any()):
-        raise ValueError('Expected wPSI in [0,1]; check the upstream definition')
+    range_audit = _audit_wpsi_range(matrix, gene_tables[program], out, prefix, wpsi_tolerance)
 
     tables = annotate_within_celltype({program: gene_tables[program]}, data, config,
                                      association_summary, population_direction, inplace=False)
@@ -214,7 +293,6 @@ def generate_program_report(data, config, gene_tables, association_summary,
     selected = selected.drop(columns='plot_label', errors='ignore').merge(
         genes[['gene_id', 'plot_label']], on='gene_id', validate='one_to_one')
 
-    out = Path(output_dir if output_dir is not None else Path(config['output_root']) / 'layer3')
     out.mkdir(parents=True, exist_ok=True)
     figures = {}
     def save(fig, name):
@@ -420,6 +498,7 @@ def generate_program_report(data, config, gene_tables, association_summary,
                 save(fig, 'G_enrichment_length_overlap')
 
     summary = dict(program=program, celltype=celltype, group_a=a, group_b=b,
+                   wpsi_range_audit=range_audit,
                    association=association_summary.loc[program].to_dict(),
                    population_direction=population_direction.loc[program].to_dict(),
                    cell_counts=subset[group_col].value_counts().to_dict(),
@@ -478,6 +557,8 @@ def generate_program_report(data, config, gene_tables, association_summary,
         CSV 同时保留原始 p、{program} 内 BH q、两种长短分类和原 Layer3 concordance，互不覆盖。
         所有细胞均值纳入有效的 0 和 1，NaN 不填零；两组细胞不要求同时具有 usage 才参加 wPSI 检验。
         wpsi_interior_fraction 是 0<wPSI<1 的比例，不代表基因表达检出率。
+        范围诊断状态：{range_audit['status']}；浮点容差为 {wpsi_tolerance}，不裁剪、不缩放原始数据。
+        非核心基因的细胞级越界单独记录；核心基因或参与绘图/背景比较的缓存中位数明显越界时先保存诊断并停止。
         缺失样本标签的细胞仍参加细胞分析，但不参加样本分析。
         如仅细胞级显著、样本级不显著，不能据此宣称跨患者重复成立。
         关键基因为预先指定列表，不按显著性挑选；缺失于核心集的基因记录在 summary JSON。

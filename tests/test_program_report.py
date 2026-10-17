@@ -1,5 +1,6 @@
 """Program report: direct length signs, zero handling and sample inference."""
 from pathlib import Path
+import json
 import tempfile
 import unittest
 
@@ -8,12 +9,77 @@ import pandas as pd
 
 from depa_downstream import (build_program_gene_tables, compute_contrast_association,
                              summarize_program_associations, compute_population_direction)
-from depa_downstream.program_report import generate_program_report, _preference
+from depa_downstream.program_report import generate_program_report, _preference, _audit_wpsi_range
 from test_workflow import fixture, FakeEnrichr
 from depa_downstream import run_functional_enrichment
 
 
 class ProgramReportTests(unittest.TestCase):
+    def _range_fixture(self):
+        table = pd.DataFrame({'gene_id': ['core', 'background'], 'symbol': ['C', 'B'],
+                              'is_core': [True, False], 'is_wpsi_reliable': [True, True],
+                              'gene_wpsi_median': [.2, .5]})
+        matrix = pd.DataFrame([[.1, .3], [.4, .6]], index=table.gene_id, columns=['A', 'B'])
+        return table, matrix
+
+    def test_floating_boundary_deviations_are_retained_and_audited(self):
+        table, matrix = self._range_fixture()
+        matrix.loc['core'] = [-1e-12, 1 + 1e-8]
+        original = matrix.copy(deep=True)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertWarnsRegex(UserWarning, 'within_floating_tolerance'):
+                summary = _audit_wpsi_range(matrix, table, directory, 'P02', 1e-6)
+            examples = pd.read_csv(Path(directory)/'P02_wpsi_range_examples.csv')
+            self.assertEqual(summary['n_strict_outside_0_1'], 2)
+            self.assertEqual(summary['n_outside_tolerance'], 0)
+            self.assertFalse(summary['values_modified'])
+            self.assertLess(examples.wpsi.min(), 0)
+            self.assertGreater(examples.wpsi.max(), 1)
+        pd.testing.assert_frame_equal(matrix, original)
+
+    def test_noncore_cell_outlier_does_not_block_core_report(self):
+        table, matrix = self._range_fixture()
+        matrix.loc['background', 'A'] = 2
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertWarnsRegex(UserWarning, 'noncore_outliers_only'):
+                summary = _audit_wpsi_range(matrix, table, directory, 'P02', 1e-6)
+        self.assertEqual(summary['n_noncore_outside_tolerance'], 1)
+        self.assertEqual(summary['n_core_outside_tolerance'], 0)
+
+    def test_material_core_outlier_exports_diagnostics_before_stopping(self):
+        table, matrix = self._range_fixture()
+        matrix.loc['core', 'A'] = -.2
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'min=-0.2'):
+                _audit_wpsi_range(matrix, table, directory, 'P02', 1e-6)
+            saved = json.loads((Path(directory)/'P02_wpsi_range_summary.json').read_text())
+            self.assertEqual(saved['status'], 'blocked_material_outliers')
+            self.assertEqual(saved['n_core_outside_tolerance'], 1)
+            self.assertTrue((Path(directory)/'P02_wpsi_range_by_gene.csv').is_file())
+
+    def test_percentage_like_scale_is_not_automatically_rescaled(self):
+        table, matrix = self._range_fixture()
+        matrix *= 100
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, 'do not automatically divide by 100'):
+                _audit_wpsi_range(matrix, table, directory, 'P02', 1e-6)
+        self.assertEqual(matrix.loc['core', 'A'], 10)
+
+    def test_invalid_reliable_cached_background_median_is_not_ignored(self):
+        table, matrix = self._range_fixture()
+        table.loc[1, 'gene_wpsi_median'] = 2
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, '1 cached medians used by the report'):
+                _audit_wpsi_range(matrix, table, directory, 'P02', 1e-6)
+
+    def test_unreliable_core_cached_median_is_still_audited_for_the_pooled_plot(self):
+        table, matrix = self._range_fixture()
+        table.loc[0, 'is_wpsi_reliable'] = False
+        table.loc[0, 'gene_wpsi_median'] = -99
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, '1 cached medians used by the report'):
+                _audit_wpsi_range(matrix, table, directory, 'P02', 1e-6)
+
     def test_another_program_uses_its_own_genes_labels_and_output_prefix(self):
         data, config = fixture()
         tables = build_program_gene_tables(data, config)

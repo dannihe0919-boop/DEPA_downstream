@@ -160,3 +160,9 @@ p02_report = generate_program_report(
 `significance='p'` 可展示原始 p 的探索性分类。所有差值固定为疾病组 B−A，偏短为蓝、偏长为橙。
 必须确认上游 wPSI 越大是否表示远端偏好，且未检出值没有被填成 0。
 样本检验比较独立样本均值，两组至少各两个合格样本；sample ID 不能自动视为独立患者。
+
+wPSI 范围检查默认允许 `1e-6` 以内的边界浮点偏差，保留原值，不裁剪或缩放。
+报告先写入 `<program>_wpsi_range_summary.json`、`<program>_wpsi_range_by_gene.csv`
+和 `<program>_wpsi_range_examples.csv`（最多 1000 条越界示例）。非核心基因的细胞级
+越界仅记录；核心基因值或参与绘图/背景比较的缓存中位数明显越界时停止，并在报错中给出范围与文件位置。
+不能仅凭最大值大于 1 就自动认定为百分制并除以 100；应先核对上游定义与缺失值编码。
