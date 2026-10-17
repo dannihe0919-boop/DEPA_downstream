@@ -9,6 +9,19 @@ from statsmodels.stats.multitest import multipletests
 from .layer2_association import resolve_disease_contrast
 
 
+def _mwu(a, b):
+    """Return U/p, defining identical pooled constants as no difference.
+
+    Some SciPy versions return NaN for the zero-variance all-tied case;
+    passing that NaN to BH would invalidate every corrected p in the family.
+    Inputs here are nonempty finite arrays after the caller's QC.
+    """
+    if np.all(np.asarray(a) == np.asarray(a)[0]) and np.all(np.asarray(b) == np.asarray(a)[0]):
+        return float(len(a) * len(b) / 2), 1.0
+    result = mannwhitneyu(a, b, alternative='two-sided')
+    return float(result.statistic), float(result.pvalue)
+
+
 def compute_population_direction(gene_tables: dict, config: dict) -> pd.DataFrame:
     """Use Layer 0 cached medians/QC and core flags, without rescreening genes.
 
@@ -36,7 +49,7 @@ def compute_population_direction(gene_tables: dict, config: dict) -> pd.DataFram
         if table['is_wpsi_reliable'].notna().any():
             row['status'] = 'insufficient_foreground' if len(foreground) < minimum else 'insufficient_background'
             if len(foreground) >= minimum and len(background) >= minimum:
-                statistic, p = mannwhitneyu(foreground['gene_wpsi_median'], background['gene_wpsi_median'], alternative='two-sided')
+                statistic, p = _mwu(foreground['gene_wpsi_median'], background['gene_wpsi_median'])
                 fg = float(foreground['gene_wpsi_median'].median())
                 bg = float(background['gene_wpsi_median'].median())
                 delta = fg - bg
@@ -151,7 +164,7 @@ def annotate_within_celltype(gene_tables: dict, data: dict, config: dict,
             elif nsa < min_samples or nsb < min_samples:
                 table.at[index, 'within_celltype_status'] = 'insufficient_samples'
             else:
-                table.at[index, 'within_celltype_p'] = mannwhitneyu(a, b, alternative='two-sided').pvalue
+                table.at[index, 'within_celltype_p'] = _mwu(a, b)[1]
                 table.at[index, 'within_celltype_status'] = 'tested'
                 tested.append(index)
         if tested:

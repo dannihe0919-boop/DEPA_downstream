@@ -1,0 +1,486 @@
+"""P02 report supplement. Run from the repository-root Notebook after Layer 3.
+
+No network queries; no changes to the shared Layer 0 tables. All wPSI values,
+including 0 and 1, are retained. NaN is never replaced by zero.
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import textwrap
+
+import numpy as np
+import pandas as pd
+from scipy.stats import mannwhitneyu, spearmanr
+from statsmodels.stats.multitest import multipletests
+
+from depa_downstream.layer2_association import resolve_disease_contrast
+from depa_downstream.layer3_direction import annotate_within_celltype
+
+DEFAULT_GENES = ['CENPM', 'NAP1L1', 'TPX2', 'MPC1', 'SOX4', 'STMN1',
+                 'PTP4A2', 'PCLAF', 'HNRNPA1', 'HNRNPA0', 'CACYBP', 'PSIP1']
+COLORS = {'shorter': '#3575AD', 'longer': '#DE8744',
+          'inconclusive': '#A5A5A5', 'not_tested': '#DDDDDD'}
+GROUP_COLORS = ['#526A91', '#B64852']
+
+
+def _bh(values):
+    result = pd.Series(np.nan, index=values.index, dtype=float)
+    valid = values.notna()
+    if valid.any():
+        result.loc[valid] = multipletests(values.loc[valid], method='fdr_bh')[1]
+    return result
+
+
+def _preference(delta, p, eligible, alpha, effect):
+    result = pd.Series('not_tested', index=delta.index, dtype=object)
+    tested = eligible & delta.notna() & p.notna()
+    result.loc[tested] = 'inconclusive'
+    significant = tested & p.lt(alpha) & delta.abs().ge(effect)
+    result.loc[significant & delta.lt(0)] = 'shorter'
+    result.loc[significant & delta.gt(0)] = 'longer'
+    return result
+
+
+def generate_p02_report(data, config, gene_tables, association_summary,
+                        population_direction, *, output_dir=None, key_genes=None,
+                        enrichment=None,
+                        significance='padj', alpha=0.05, effect_threshold=0.01,
+                        min_cells_per_sample=10, n_bins=5, formats=('png', 'pdf', 'svg')):
+    """Export P02 tables and figures into the existing layer3 directory.
+
+    Reuse Layer 0 core membership and Layer 2 selected cell type. Recompute only
+    P02's within-cell-type statistics on a copy to avoid stale Notebook outputs.
+    Main plot defaults to within-P02 BH q<.05, |mean B-A|>=.01; raw-p labels and
+    original Layer 3 concordance are also exported. Sample-level tests compare
+    unpaired sample means, with at least two usable samples in each group.
+
+    Return a dict with DataFrames, summary metadata and saved figure paths.
+    This function assumes increasing wPSI means distal/longer 3'UTR preference;
+    confirm this and the upstream meaning of zero before biological reporting.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    if significance not in ('p', 'padj') or not 0 < alpha < 1:
+        raise ValueError('Use significance=p or padj and 0<alpha<1')
+    if (not np.isfinite(effect_threshold) or effect_threshold < 0
+            or min_cells_per_sample < 1 or n_bins < 2):
+        raise ValueError('Invalid effect, sample-cell or bin threshold')
+    if not formats or set(formats) - {'png', 'pdf', 'svg'}:
+        raise ValueError('formats must contain png, pdf and/or svg')
+    if 'P02' not in gene_tables or 'P02' not in data['usage']:
+        raise ValueError('P02 is missing from gene tables or usage')
+    if data.get('wpsi') is None:
+        raise ValueError('wPSI is required; no values will be imputed')
+    disease = resolve_disease_contrast(config)
+    if disease is None:
+        raise ValueError('A disease contrast with group_a/group_b is required')
+    celltype = association_summary.loc['P02', 'best_celltype']
+    if pd.isna(celltype):
+        raise ValueError('Layer 2 has no selected P02 cell type')
+    a, b, group_col = disease['group_a'], disease['group_b'], disease['column']
+    type_col = config['meta_columns']['celltype']
+    sample_col = config['meta_columns'].get('sample')
+    meta = data['meta']
+    subset = meta.loc[meta[type_col].eq(celltype) & meta[group_col].isin([a, b])].copy()
+    subset = subset.loc[subset.index.intersection(data['wpsi'].columns)]
+    if not all(subset[group_col].eq(g).any() for g in (a, b)):
+        raise ValueError('Both disease groups must occur inside the selected cell type')
+    ids = gene_tables['P02']['gene_id']
+    if ids.duplicated().any():
+        raise ValueError('Layer 0 gene IDs must be unique')
+    matrix = data['wpsi'].reindex(index=ids, columns=subset.index).replace([np.inf, -np.inf], np.nan)
+    finite = matrix.to_numpy()[np.isfinite(matrix.to_numpy())]
+    if finite.size and ((finite < 0).any() or (finite > 1).any()):
+        raise ValueError('Expected wPSI in [0,1]; check the upstream definition')
+
+    tables = annotate_within_celltype({'P02': gene_tables['P02']}, data, config,
+                                     association_summary, population_direction, inplace=False)
+    genes = tables['P02'].loc[lambda t: t['is_core']].copy().reset_index(drop=True)
+    if genes.empty:
+        raise ValueError('P02 has no Layer 0 core genes')
+    eligible = genes.within_celltype_status.isin(['tested', 'unknown_expected_direction'])
+    # Also supports the earlier Layer3 module when this file is downloaded alone.
+    # An undefined population expectation must not prevent a direct B-A analysis.
+    for index, row in genes.loc[eligible].iterrows():
+        values = matrix.loc[row.gene_id].dropna()
+        if len(values) and values.nunique() == 1:
+            genes.at[index, 'within_celltype_p'] = 1.0
+    genes['within_celltype_padj'] = _bh(genes.within_celltype_p)
+    genes['report_length_preference_raw_p'] = _preference(
+        genes.within_celltype_mean_diff, genes.within_celltype_p,
+        eligible, alpha, effect_threshold)
+    genes['report_length_preference_bh'] = _preference(
+        genes.within_celltype_mean_diff, genes.within_celltype_padj,
+        eligible, alpha, effect_threshold)
+    genes['report_length_preference'] = genes['report_length_preference_bh' if significance == 'padj'
+                                             else 'report_length_preference_raw_p']
+    genes['pooled_delta_from_background'] = genes.gene_wpsi_median - population_direction.loc['P02', 'bg_median']
+    # Explicitly named interior fraction: it is NOT an expression-detection rate.
+    genes['wpsi_interior_fraction_a'] = genes.within_celltype_detection_rate_a
+    genes['wpsi_interior_fraction_b'] = genes.within_celltype_detection_rate_b
+
+    usage = data['usage']['P02'].reindex(subset.index).replace([np.inf, -np.inf], np.nan)
+    sample_rows, usage_rows, bin_rows, corr_rows = [], [], [], []
+    has_samples = sample_col is not None and sample_col in subset
+    sample_groups = (list(subset.dropna(subset=[sample_col]).groupby([group_col, sample_col], observed=True))
+                     if has_samples else [])
+    for group in (a, b):
+        vals = usage.loc[subset[group_col].eq(group)].dropna()
+        usage_rows.append(dict(level='cell', group=group, sample=None, n_cells=len(vals),
+                               usage_mean=vals.mean(), usage_median=vals.median()))
+    for (group, sample), sample_meta in sample_groups:
+        vals = usage.reindex(sample_meta.index).dropna()
+        usage_rows.append(dict(level='sample', group=group, sample=sample, n_cells=len(vals),
+                               usage_mean=vals.mean(), usage_median=vals.median()))
+        for row in genes.itertuples():
+            values = matrix.loc[row.gene_id, sample_meta.index].dropna()
+            sample_rows.append(dict(gene_id=row.gene_id, symbol=row.symbol, group=group,
+                                    sample=sample, n_cells_total=len(sample_meta), n_valid=len(values),
+                                    wpsi_mean=values.mean(), wpsi_median=values.median(),
+                                    wpsi_nonzero_fraction=values.gt(0).mean(),
+                                    wpsi_zero_fraction=values.eq(0).mean(),
+                                    wpsi_one_fraction=values.eq(1).mean(),
+                                    eligible=len(values) >= min_cells_per_sample))
+    sample_table = pd.DataFrame(sample_rows, columns=[
+        'gene_id', 'symbol', 'group', 'sample', 'n_cells_total', 'n_valid', 'wpsi_mean',
+        'wpsi_median', 'wpsi_nonzero_fraction', 'wpsi_zero_fraction', 'wpsi_one_fraction', 'eligible'])
+    sample_effects = []
+    for row in genes.itertuples():
+        valid = sample_table.loc[sample_table.gene_id.eq(row.gene_id) & sample_table.eligible.eq(True)]
+        va = valid.loc[valid.group.eq(a), 'wpsi_mean'].dropna()
+        vb = valid.loc[valid.group.eq(b), 'wpsi_mean'].dropna()
+        shared = set(valid.loc[valid.group.eq(a), 'sample']) & set(valid.loc[valid.group.eq(b), 'sample'])
+        status = ('missing_sample_metadata' if not has_samples else 'shared_sample_ids_require_paired_design'
+                  if shared else 'tested' if len(va) >= 2 and len(vb) >= 2 else 'insufficient_samples')
+        p = np.nan
+        if status == 'tested':
+            p = (1.0 if va.nunique() == 1 and vb.eq(va.iloc[0]).all()
+                 else mannwhitneyu(va, vb, alternative='two-sided').pvalue)
+        sample_effects.append(dict(gene_id=row.gene_id, sample_n_a=len(va), sample_n_b=len(vb),
+                                   sample_mean_a=va.mean(), sample_mean_b=vb.mean(),
+                                   sample_mean_diff=vb.mean() - va.mean(), sample_p=p, sample_status=status))
+    sample_effects = pd.DataFrame(sample_effects)
+    sample_effects['sample_padj'] = _bh(sample_effects.sample_p)
+    sample_effects['sample_length_preference_bh'] = _preference(
+        sample_effects.sample_mean_diff, sample_effects.sample_padj,
+        sample_effects.sample_status.eq('tested'), alpha, effect_threshold)
+    genes = genes.merge(sample_effects, on='gene_id', validate='one_to_one')
+    genes = genes.sort_values(['spectra_z', 'gene_id'], ascending=[False, True]).reset_index(drop=True)
+
+    # Shared usage cutpoints, but separate disease groups and separate samples.
+    # Bin means are descriptive, not tests; no selection for favorable slopes.
+    bins = pd.Series(np.nan, index=subset.index)
+    if usage.dropna().nunique() > 1:
+        bins.loc[usage.notna()] = pd.qcut(usage.dropna(), n_bins, labels=False, duplicates='drop').astype(float)
+    for row in genes.itertuples():
+        frame = pd.DataFrame({'wpsi': matrix.loc[row.gene_id], 'usage': usage,
+                              'group': subset[group_col], 'bin': bins})
+        if has_samples:
+            frame['sample'] = subset[sample_col]
+        for group in (a, b):
+            group_frame = frame.loc[frame.group.eq(group)].dropna(subset=['usage', 'wpsi'])
+            rho = (spearmanr(group_frame.usage, group_frame.wpsi).statistic
+                   if len(group_frame) >= 3 and group_frame.usage.nunique() > 1
+                   and group_frame.wpsi.nunique() > 1 else np.nan)
+            corr_rows.append(dict(gene_id=row.gene_id, symbol=row.symbol, group=group,
+                                  n_cells=len(group_frame), spearman_rho=rho,
+                                  interpretation='descriptive cell correlation; not independent-sample inference'))
+        if has_samples:
+            for (group, sample, bin_id), sub in frame.dropna().groupby(['group', 'sample', 'bin'], observed=True):
+                bin_rows.append(dict(gene_id=row.gene_id, symbol=row.symbol, group=group,
+                                     sample=sample, usage_bin=int(bin_id), n_cells=len(sub),
+                                     usage_mean=sub.usage.mean(), wpsi_mean=sub.wpsi.mean()))
+    bin_table = pd.DataFrame(bin_rows, columns=['gene_id', 'symbol', 'group', 'sample',
+                                               'usage_bin', 'n_cells', 'usage_mean', 'wpsi_mean'])
+    usage_table = pd.DataFrame(usage_rows)
+    corr_table = pd.DataFrame(corr_rows)
+    requested = list(dict.fromkeys(DEFAULT_GENES if key_genes is None else key_genes))
+    selected = genes.loc[genes.symbol.isin(requested)].copy()
+    if selected.empty:
+        selected = genes.head(8).copy()  # Fixed weight ranking, not significance selection.
+    else:
+        selected['_order'] = selected.symbol.map({g: i for i, g in enumerate(requested)})
+        selected = selected.sort_values(['_order', 'gene_id']).drop(columns='_order')
+    # Keep symbol collisions visible by including gene ID in the label.
+    duplicates = genes.symbol.duplicated(keep=False)
+    genes['plot_label'] = genes.symbol.astype(str)
+    genes.loc[duplicates, 'plot_label'] += ' [' + genes.loc[duplicates, 'gene_id'].astype(str) + ']'
+    selected = selected.drop(columns='plot_label', errors='ignore').merge(
+        genes[['gene_id', 'plot_label']], on='gene_id', validate='one_to_one')
+
+    out = Path(output_dir if output_dir is not None else Path(config['output_root']) / 'layer3')
+    out.mkdir(parents=True, exist_ok=True)
+    figures = {}
+    def save(fig, name):
+        paths = []
+        for extension in formats:
+            path = out / f'P02_{name}.{extension}'
+            fig.savefig(path, dpi=300, bbox_inches='tight', facecolor='white')
+            paths.append(str(path))
+        plt.close(fig)
+        figures[name] = paths
+
+    with plt.rc_context({'font.size': 10, 'pdf.fonttype': 42, 'ps.fonttype': 42,
+                         'svg.fonttype': 'none', 'axes.spines.top': False,
+                         'axes.spines.right': False}):
+        # A. Program localization and within-cell-type usage. No significance stars.
+        coords = config['meta_columns']
+        umap = all(coords.get(k) in meta for k in ('umap1', 'umap2'))
+        fig, axes = plt.subplots(1, 3 if umap else 1, figsize=(14 if umap else 5, 4), squeeze=False)
+        ax = axes[0, -1]
+        if umap:
+            xy = meta[[coords['umap1'], coords['umap2']]].apply(pd.to_numeric, errors='coerce')
+            valid = xy.notna().all(axis=1)
+            for axis in axes[0, :2]:
+                axis.scatter(xy.loc[valid].iloc[:, 0], xy.loc[valid].iloc[:, 1], s=2, c='#DCDCDC', rasterized=True)
+                axis.set(xticks=[], yticks=[], xlabel='UMAP 1', ylabel='UMAP 2')
+            mask = valid & meta[type_col].eq(celltype)
+            axes[0, 0].scatter(xy.loc[mask].iloc[:, 0], xy.loc[mask].iloc[:, 1], s=3, c='#526A91', rasterized=True)
+            axes[0, 0].set_title(str(celltype))
+            uv = data['usage']['P02'].reindex(meta.index)
+            mask = valid & uv.notna()
+            cells = uv.loc[mask].sort_values().index
+            sc = axes[0, 1].scatter(xy.loc[cells].iloc[:, 0], xy.loc[cells].iloc[:, 1], c=uv.loc[cells],
+                                    s=3, cmap='viridis', rasterized=True)
+            fig.colorbar(sc, ax=axes[0, 1], label='P02 usage', fraction=.04)
+            axes[0, 1].set_title('P02 usage (all cells)')
+        ua, ub = [usage.loc[subset[group_col].eq(g)].dropna() for g in (a, b)]
+        box = ax.boxplot([ua, ub], patch_artist=True, showfliers=False)
+        for patch, color in zip(box['boxes'], GROUP_COLORS):
+            patch.set_facecolor(color)
+            patch.set_alpha(.4)
+        su = usage_table.loc[usage_table.level.eq('sample')]
+        for i, (group, color) in enumerate(zip((a, b), GROUP_COLORS), 1):
+            vals = su.loc[su.group.eq(group), 'usage_mean'].dropna()
+            ax.scatter(i + np.linspace(-.08, .08, len(vals)), vals, color=color, edgecolor='white', s=45, zorder=3)
+        auc = mannwhitneyu(ub, ua, alternative='two-sided').statistic / (len(ua) * len(ub)) if len(ua) and len(ub) else np.nan
+        ax.set(xticks=[1, 2], xticklabels=[f'{a}\nn={len(ua)}', f'{b}\nn={len(ub)}'], ylabel='P02 usage',
+               title=f'Within selected cell type\nAUC(B vs A)={auc:.3f}; dots: sample means')
+        fig.tight_layout()
+        save(fig, 'A_identity_usage')
+
+        # B. Pooled absolute preference is kept separate from disease change.
+        ordered = genes.sort_values(['gene_wpsi_median', 'gene_id'], na_position='last')
+        fig, ax = plt.subplots(figsize=(7, max(4, .24 * len(ordered))))
+        bg = population_direction.loc['P02', 'bg_median']
+        for y, row in enumerate(ordered.itertuples()):
+            marker = '*' if row.is_specific else 'o'
+            reliable = pd.notna(row.is_wpsi_reliable) and bool(row.is_wpsi_reliable)
+            ax.scatter(row.gene_wpsi_median, y, marker=marker, s=80 if row.is_specific else 25,
+                       color='#526A91' if reliable else '#C4C4C4')
+        if np.isfinite(bg):
+            ax.axvline(bg, color='black', ls='--', label=f'Background median={bg:.3f}')
+        ax.set(yticks=range(len(ordered)), yticklabels=ordered.plot_label, xlim=(-.02, 1.02),
+               xlabel='Across-cell gene wPSI median', title='Pooled preference; not a disease difference\nStar: specific marker; grey: fails wPSI reliability flag')
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        save(fig, 'B_pooled_preference')
+
+        # C. All core genes, group means + direct length interpretation + BH q.
+        ordered = genes.sort_values(['within_celltype_mean_diff', 'gene_id'], na_position='last')
+        fig, (left, right) = plt.subplots(1, 2, figsize=(12, max(5, .27 * len(ordered))), sharey=True)
+        for y, row in enumerate(ordered.itertuples()):
+            left.plot([row.within_celltype_mean_a, row.within_celltype_mean_b], [y, y], c='#BBBBBB', lw=1)
+            for value, color in zip([row.within_celltype_mean_a, row.within_celltype_mean_b], GROUP_COLORS):
+                left.scatter(value, y, s=24, color=color)
+            color = COLORS[row.report_length_preference]
+            right.barh(y, row.within_celltype_mean_diff, color=color, height=.7)
+            q = row.within_celltype_padj
+            right.text(1.02, y, f'q={q:.2g}' if np.isfinite(q) else row.within_celltype_status,
+                       transform=right.get_yaxis_transform(), va='center', fontsize=7)
+        left.set(yticks=range(len(ordered)), yticklabels=ordered.plot_label, xlim=(-.02, 1.02),
+                 xlabel='Mean wPSI', title=f'Within {celltype}')
+        left.legend(handles=[Patch(color=c, label=str(g)) for g, c in zip((a, b), GROUP_COLORS)], fontsize=8)
+        right.axvline(0, c='black', lw=.8)
+        for x in (-effect_threshold, effect_threshold):
+            right.axvline(x, c='#888888', lw=.7, ls=':')
+        right.set(xlabel=f'Mean wPSI difference ({b} - {a})',
+                  title=f'Blue: shorter; orange: longer\n{significance}<{alpha}, |difference|>={effect_threshold}')
+        right.legend(handles=[Patch(color=c, label=k) for k, c in COLORS.items()], loc='lower right', fontsize=8)
+        fig.tight_layout(rect=(0, 0, .91, 1))
+        save(fig, 'C_core_gene_length_changes')
+
+        # D. Empirical CDF shows exact 0/1 mass without violin smoothing.
+        ncols = min(3, len(selected))
+        nrows = int(np.ceil(len(selected) / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4.5*ncols, 3.2*nrows), squeeze=False)
+        for ax, row in zip(axes.flat, selected.itertuples()):
+            for group, color in zip((a, b), GROUP_COLORS):
+                vals = matrix.loc[row.gene_id, subset.index[subset[group_col].eq(group)]].dropna().sort_values().to_numpy()
+                if len(vals):
+                    ax.step(np.r_[vals[0], vals], np.r_[0, np.arange(1, len(vals)+1)/len(vals)],
+                            where='post', c=color, label=f'{group} (n={len(vals)})')
+                    ax.axvline(vals.mean(), c=color, lw=.8, ls=':')
+            ax.set(xlim=(-.02, 1.02), ylim=(0, 1.03), xlabel='wPSI (0 and 1 retained)', ylabel='Cumulative cell fraction',
+                   title=f'{row.plot_label}: {row.report_length_preference}\n'
+                         f'diff={row.within_celltype_mean_diff:.3f}, q={row.within_celltype_padj:.2g}')
+            ax.legend(fontsize=7, loc='lower right')
+        for ax in list(axes.flat)[len(selected):]:
+            ax.set_visible(False)
+        fig.suptitle(f'Within {celltype}; dotted lines: means', y=1.01)
+        fig.tight_layout()
+        save(fig, 'D_key_gene_distributions')
+
+        # E/F always exist; absence of usable sample metadata is explicit.
+        for suffix, mode in [('E_key_gene_sample_means', 'sample'), ('F_usage_wpsi_trends', 'bins')]:
+            fig, axes = plt.subplots(nrows, ncols, figsize=(4.5*ncols, 3.2*nrows), squeeze=False)
+            for ax, row in zip(axes.flat, selected.itertuples()):
+                if mode == 'sample':
+                    for i, (group, color) in enumerate(zip((a, b), GROUP_COLORS), 1):
+                        sub = sample_table.loc[sample_table.gene_id.eq(row.gene_id) & sample_table.group.eq(group)]
+                        sub = sub.sort_values('sample')
+                        for x, val in zip(i + np.linspace(-.12, .12, len(sub)), sub.itertuples()):
+                            ax.scatter(x, val.wpsi_mean, s=40, edgecolor=color,
+                                       facecolor=color if val.eligible else 'none')
+                            ax.annotate(str(val.sample), (x, val.wpsi_mean), xytext=(3, 2),
+                                        textcoords='offset points', fontsize=6)
+                        usable = sub.loc[sub.eligible.eq(True), 'wpsi_mean'].dropna()
+                        if len(usable):
+                            ax.plot([i-.2, i+.2], [usable.mean()]*2, c='black', lw=1)
+                    ax.set(xticks=[1, 2], xticklabels=[str(a), str(b)], xlim=(.6, 2.6), ylim=(-.03, 1.03),
+                           ylabel='Per-sample mean wPSI', title=f'{row.plot_label}\n'
+                           f'sample diff={row.sample_mean_diff:.3f}; q={row.sample_padj:.2g}')
+                    if row.sample_status != 'tested':
+                        ax.text(.02, .95, row.sample_status.replace('_', ' '), transform=ax.transAxes,
+                                va='top', fontsize=7)
+                else:
+                    for group, color in zip((a, b), GROUP_COLORS):
+                        sub = bin_table.loc[bin_table.gene_id.eq(row.gene_id) & bin_table.group.eq(group)
+                                            & bin_table.n_cells.ge(min_cells_per_sample)]
+                        for _, trace in sub.groupby('sample', observed=True):
+                            trace = trace.sort_values('usage_bin')
+                            ax.plot(trace.usage_mean, trace.wpsi_mean, c=color, alpha=.2, lw=.8)
+                        avg = sub.groupby('usage_bin', observed=True)[['usage_mean', 'wpsi_mean']].mean()
+                        if not avg.empty:
+                            ax.plot(avg.usage_mean, avg.wpsi_mean, '-o', c=color, ms=4, label=str(group))
+                    ax.set(xlabel='P02 usage (shared quantile bins)', ylabel='Mean wPSI', ylim=(-.03, 1.03),
+                           title=f'{row.plot_label}\nThin: samples; thick: equal-sample mean')
+                    if ax.get_legend_handles_labels()[0]:
+                        ax.legend(fontsize=7)
+                    if bin_table.empty:
+                        ax.text(.05, .5, 'No usable sample/bin data', transform=ax.transAxes)
+            for ax in list(axes.flat)[len(selected):]:
+                ax.set_visible(False)
+            fig.tight_layout()
+            save(fig, suffix)
+
+        # G. Annotate existing Layer 1 hits; do not re-enrich selected subsets.
+        overlap_rows = []
+        symbol_groups = {label: set(genes.loc[genes.report_length_preference.eq(label), 'symbol'].str.upper())
+                         for label in COLORS}
+        for kind, terms in (enrichment or {}).get('P02', {}).items():
+            if terms is None or terms.empty:
+                continue
+            for term in terms.itertuples():
+                raw_hits = getattr(term, 'genes', '')
+                hits = ({str(g).strip().upper() for g in raw_hits}
+                        if isinstance(raw_hits, (list, tuple, set)) else
+                        {g.strip().upper() for g in str(raw_hits).split(';') if g.strip()})
+                record = dict(gene_set=kind, database=term.database, term=term.term,
+                              enrichment_padj=term.padj, hit_symbols=';'.join(sorted(hits)))
+                accounted = set()
+                for label, group_symbols in symbol_groups.items():
+                    matched = hits & group_symbols
+                    record[f'n_{label}'] = len(matched)
+                    record[f'{label}_genes'] = ';'.join(sorted(matched))
+                    accounted.update(matched)
+                record['n_unmatched'] = len(hits - accounted)
+                record['unmatched_genes'] = ';'.join(sorted(hits - accounted))
+                overlap_rows.append(record)
+        overlap_columns = ['gene_set', 'database', 'term', 'enrichment_padj', 'hit_symbols']
+        for label in COLORS:
+            overlap_columns += [f'n_{label}', f'{label}_genes']
+        overlap_columns += ['n_unmatched', 'unmatched_genes']
+        overlap_table = pd.DataFrame(overlap_rows, columns=overlap_columns)
+        if not overlap_table.empty:
+            top = (overlap_table.loc[overlap_table.enrichment_padj.lt(alpha)]
+                   .sort_values('enrichment_padj').drop_duplicates(['database', 'term']).head(12))
+            if not top.empty:
+                fig, ax = plt.subplots(figsize=(11, max(4, .45*len(top))))
+                offset = np.zeros(len(top))
+                for label, color in COLORS.items():
+                    values = top[f'n_{label}'].to_numpy()
+                    ax.barh(range(len(top)), values, left=offset, color=color, label=label)
+                    offset += values
+                ax.barh(range(len(top)), top.n_unmatched, left=offset, color='white',
+                        edgecolor='black', label='unmatched')
+                labels = [textwrap.fill(f'{r.gene_set}: {r.term}', 55) for r in top.itertuples()]
+                ax.set(yticks=range(len(top)), yticklabels=labels, xlabel='Number of hit gene symbols',
+                       title='Existing enrichment terms annotated by wPSI change\n'
+                             'Hit counts only; no new subgroup enrichment tests')
+                ax.invert_yaxis()
+                ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.01, 1))
+                fig.tight_layout()
+                save(fig, 'G_enrichment_length_overlap')
+
+    summary = dict(program='P02', celltype=celltype, group_a=a, group_b=b,
+                   association=association_summary.loc['P02'].to_dict(),
+                   population_direction=population_direction.loc['P02'].to_dict(),
+                   cell_counts=subset[group_col].value_counts().to_dict(),
+                   n_core=len(genes), classification_counts=genes.report_length_preference.value_counts().to_dict(),
+                   raw_p_counts=genes.report_length_preference_raw_p.value_counts().to_dict(),
+                   bh_counts=genes.report_length_preference_bh.value_counts().to_dict(),
+                   significance=significance, alpha=alpha, effect_threshold=effect_threshold,
+                   min_cells_per_sample=min_cells_per_sample, n_bins=n_bins,
+                   sample_tests='unpaired MWU on eligible sample means; BH across P02 core genes',
+                   enrichment_overlap_status='annotated' if not overlap_table.empty else 'no_existing_terms',
+                   missing_sample_labels=int(subset[sample_col].isna().sum()) if has_samples else len(subset),
+                   requested_genes=requested, unavailable_key_genes=[g for g in requested if g not in set(genes.symbol)],
+                   assumptions=['Higher wPSI means distal/longer relative 3UTR preference.',
+                                'Upstream missingness must be NaN, not encoded as zero.',
+                                'Sample identifiers are not automatically independent patients.',
+                                'Cell-level p/q are exploratory; pooled preference does not establish a usage-wPSI slope.'])
+    for name, table in [('core_gene_statistics', genes), ('key_gene_statistics', selected),
+                        ('sample_wpsi', sample_table), ('usage_statistics', usage_table),
+                        ('usage_wpsi_bins', bin_table), ('within_group_correlations', corr_table),
+                        ('enrichment_length_overlap', overlap_table)]:
+        table.to_csv(out / f'P02_{name}.csv', index=False, encoding='utf-8-sig')
+    # Convert NaN/Inf to JSON null, preserving numeric fields.
+    def clean(value):
+        if isinstance(value, dict):
+            return {str(k): clean(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clean(v) for v in value]
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, float) and not np.isfinite(value):
+            return None
+        if value is pd.NA:
+            return None
+        return value
+    (out / 'P02_report_summary.json').write_text(json.dumps(clean(summary), indent=2, ensure_ascii=False, allow_nan=False) + '\n')
+    (out / 'P02_figure_notes.md').write_text(textwrap.dedent(f'''\
+        # P02 报告图说明
+
+        比较范围：{celltype}；A={a}，B={b}。ΔwPSI 固定为 B−A。
+        wPSI 增大解释为远端/较长 3′UTR 偏好；需核对上游定义及零值编码。
+        变化大小不是 3′UTR 长度变化百分比，也不是表达量变化。
+
+        - A：全部细胞上的 P02 分布与所选细胞群内 usage。箱线图使用全部有效细胞，隐藏离群点；散点为样本均值。
+        - B：各核心基因跨细胞的 wPSI 中位数与背景中位数。星号为专属 marker；这是基因间比较，不是疾病差异。
+        - C：同一细胞群内各核心基因两组 wPSI 均值与 B−A。蓝=偏短，橙=偏长，灰=不确定，浅灰=未完成检验。
+        - D：关键基因经验累积分布，保留零值和一值，不作平滑；虚线为均值。
+        - E：每点为一个样本的平均 wPSI；空心点表示有效细胞少于 {min_cells_per_sample}，不参加样本检验。
+          黑线为合格样本均值的等权平均；样本检验为非配对 MWU，两组各至少两个合格样本，并在 P02 内做 BH 校正。
+          同一样本 ID 跨两组时不执行非配对检验。sample 可能代表文库，不能自动视作独立患者。
+        - F：P02 usage 的共享分位数区间内，分别展示两组的 wPSI。细线=样本，粗线=样本均值等权平均。
+          每样本每区间至少 {min_cells_per_sample} 个有效细胞。曲线仅作描述，不保证单调，不作为独立因果证据。
+        - G（存在显著富集结果时）：复用 Layer1 term 的命中基因，标注其中偏短、偏长或不确定的数量。
+          此图没有对长短基因子集重新富集，不能用来宣称某一子集独立显著富集。
+
+        主图分类使用 {significance}<{alpha} 且 |ΔwPSI|≥{effect_threshold}。
+        CSV 同时保留原始 p、P02 内 BH q、两种长短分类和原 Layer3 concordance，互不覆盖。
+        所有细胞均值纳入有效的 0 和 1，NaN 不填零；两组细胞不要求同时具有 usage 才参加 wPSI 检验。
+        wpsi_interior_fraction 是 0<wPSI<1 的比例，不代表基因表达检出率。
+        缺失样本标签的细胞仍参加细胞分析，但不参加样本分析。
+        如仅细胞级显著、样本级不显著，不能据此宣称跨患者重复成立。
+        关键基因为预先指定列表，不按显著性挑选；缺失于核心集的基因记录在 summary JSON。
+        本补充分析不重新查询富集、不覆盖 Layer0、不覆盖既有 Layer3 文件。
+        同名 P02_ 文件在重复运行时会更新。
+        '''), encoding='utf-8')
+    return dict(genes=genes, key_genes=selected, sample_wpsi=sample_table,
+                usage=usage_table, usage_bins=bin_table, correlations=corr_table,
+                enrichment_overlap=overlap_table,
+                summary=summary, figures=figures, output_dir=out)
