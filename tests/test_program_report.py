@@ -9,12 +9,36 @@ import pandas as pd
 
 from depa_downstream import (build_program_gene_tables, compute_contrast_association,
                              summarize_program_associations, compute_population_direction)
-from depa_downstream.program_report import generate_program_report, _preference, _audit_wpsi_range
+from depa_downstream.program_report import (
+    generate_program_report, cleanup_report_figures, REPORT_FIGURES, _preference, _audit_wpsi_range,
+)
 from test_workflow import fixture, FakeEnrichr
 from depa_downstream import run_functional_enrichment
 
 
 class ProgramReportTests(unittest.TestCase):
+    def test_cleanup_removes_only_known_duplicates_with_pdf_counterparts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            stem = 'P02_A_identity_usage'
+            (out / f'{stem}.pdf').write_bytes(b'%PDF-1.4\nexisting PDF')
+            for ext in ('png', 'svg'):
+                (out / f'{stem}.{ext}').write_bytes(b'duplicate')
+            preserved = [
+                'P02_custom_plot.png', 'P04_A_identity_usage.png',
+                'layer3_population_direction.png', 'P02_core_gene_statistics.csv',
+                'P02_B_pooled_preference.png',  # No PDF: keep the only copy.
+                'P02_C_core_gene_length_changes.png',
+            ]
+            for name in preserved:
+                (out / name).write_bytes(b'keep')
+            (out / 'P02_C_core_gene_length_changes.pdf').write_bytes(b'not a PDF')
+            removed = cleanup_report_figures(out, program='P02')
+            self.assertEqual({Path(p).suffix for p in removed}, {'.png', '.svg'})
+            self.assertTrue(all((out / name).is_file() for name in preserved))
+            self.assertTrue((out / f'{stem}.pdf').is_file())
+            self.assertEqual(cleanup_report_figures(out, program='P02'), [])
+
     def _range_fixture(self):
         table = pd.DataFrame({'gene_id': ['core', 'background'], 'symbol': ['C', 'B'],
                               'is_core': [True, False], 'is_wpsi_reliable': [True, True],
@@ -122,9 +146,12 @@ class ProgramReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sentinel = Path(directory) / 'population_direction.csv'
             sentinel.write_text('existing results')
+            for name in REPORT_FIGURES:
+                for extension in ('png', 'svg'):
+                    (Path(directory) / f'P02_{name}.{extension}').write_bytes(b'old duplicate')
             report = generate_program_report(data, config, tables, summary, directions,
                 output_dir=directory, key_genes=['G06', 'G07', 'G08', 'G09'],
-                min_cells_per_sample=5, enrichment=enrichment, formats=('png', 'pdf', 'svg'))
+                min_cells_per_sample=5, enrichment=enrichment)
             genes = report['genes'].set_index('gene_id')
             self.assertEqual(genes.loc['G06', 'report_length_preference'], 'longer')
             self.assertEqual(genes.loc['G07', 'report_length_preference'], 'shorter')
@@ -142,8 +169,12 @@ class ProgramReportTests(unittest.TestCase):
             self.assertEqual(sentinel.read_text(), 'existing results')
             self.assertEqual(len(report['figures']), 7)
             for paths in report['figures'].values():
-                self.assertEqual(len(paths), 3)
+                self.assertEqual(len(paths), 1)
+                self.assertEqual(Path(paths[0]).suffix, '.pdf')
                 self.assertTrue(all(Path(p).stat().st_size > 100 for p in paths))
+            self.assertEqual(len(report['removed_figure_files']), 14)
+            self.assertFalse(list(Path(directory).glob('P02_*.png')))
+            self.assertFalse(list(Path(directory).glob('P02_*.svg')))
             self.assertTrue((Path(directory)/'P02_core_gene_statistics.csv').is_file())
             self.assertTrue((Path(directory)/'P02_report_summary.json').is_file())
             self.assertEqual(report['enrichment_overlap'].iloc[0]['n_longer'], 1)

@@ -154,7 +154,7 @@ p02_report = generate_program_report(
 所有文件以 program 编号开头，如 `P02_`、`P04_`，保存到之前的 `layer3`；
 同名补充文件重复运行时更新。图 A–G 分别展示 usage、整体偏好、组内基因长短变化、
 关键基因分布、样本均值、usage–wPSI 分箱趋势，以及既有富集 term 的长短基因命中数；
-图 G 仅在存在显著富集时生成。每图提供 300 dpi PNG、PDF、SVG。
+图 G 仅在存在显著富集时生成。默认仅保存 PDF，成功生成后清理该 program 同名的 PNG/SVG 副本。
 逐基因与逐样本统计、分箱数据和图注另存 CSV/JSON/Markdown。
 主图默认使用程序内 BH q<0.05 且 |ΔwPSI|≥0.01，CSV 同时保留原始 p 分类；设置
 `significance='p'` 可展示原始 p 的探索性分类。所有差值固定为疾病组 B−A，偏短为蓝、偏长为橙。
@@ -166,3 +166,14 @@ wPSI 范围检查默认允许 `1e-6` 以内的边界浮点偏差，保留原值�
 和 `<program>_wpsi_range_examples.csv`（最多 1000 条越界示例）。非核心基因的细胞级
 越界仅记录；核心基因值或参与绘图/背景比较的缓存中位数明显越界时停止，并在报错中给出范围与文件位置。
 不能仅凭最大值大于 1 就自动认定为百分制并除以 100；应先核对上游定义与缺失值编码。
+
+只清理旧图副本而不重跑统计时，可调用：
+
+```python
+from depa_downstream.program_report import cleanup_report_figures
+removed = cleanup_report_figures(OUTPUT_ROOT / 'layer3', program='P02')
+print('删除冗余图文件数：', len(removed))
+```
+
+清理仅匹配本模块 A–G 的固定文件名，且需存在对应 PDF。保留其他 program、
+其他分析图、CSV、JSON、图注与没有 PDF 副本的图片。

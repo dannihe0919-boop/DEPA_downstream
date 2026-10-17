@@ -24,6 +24,39 @@ DEFAULT_KEY_GENES = {'P02': ['CENPM', 'NAP1L1', 'TPX2', 'MPC1', 'SOX4', 'STMN1',
 COLORS = {'shorter': '#3575AD', 'longer': '#DE8744',
           'inconclusive': '#A5A5A5', 'not_tested': '#DDDDDD'}
 GROUP_COLORS = ['#526A91', '#B64852']
+REPORT_FIGURES = (
+    'A_identity_usage', 'B_pooled_preference', 'C_core_gene_length_changes',
+    'D_key_gene_distributions', 'E_key_gene_sample_means', 'F_usage_wpsi_trends',
+    'G_enrichment_length_overlap',
+)
+
+
+def cleanup_report_figures(output_dir, *, program='P02', remove_formats=('png', 'svg')):
+    """Remove only known report PNG/SVG duplicates with an existing PDF.
+
+    Never glob-delete unrelated figures, another program, tables or PDFs.
+    A missing/empty/non-PDF counterpart preserves the image as its sole copy.
+    May be called on its own without loading data or rerunning statistics.
+    """
+    if not isinstance(program, str) or not program.strip():
+        raise ValueError('program must be a nonempty string')
+    if set(remove_formats) - {'png', 'svg'}:
+        raise ValueError('Only redundant png/svg formats may be removed')
+    out, prefix = Path(output_dir), quote(program, safe='')
+    removed = []
+    for name in REPORT_FIGURES:
+        pdf = out / f'{prefix}_{name}.pdf'
+        if not pdf.is_file():
+            continue
+        with pdf.open('rb') as stream:
+            if stream.read(5) != b'%PDF-':
+                continue
+        for extension in remove_formats:
+            path = out / f'{prefix}_{name}.{extension}'
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+                removed.append(str(path))
+    return removed
 
 
 def _bh(values):
@@ -123,8 +156,8 @@ def generate_program_report(data, config, gene_tables, association_summary,
                         population_direction, *, program='P02', output_dir=None, key_genes=None,
                         enrichment=None,
                         significance='padj', alpha=0.05, effect_threshold=0.01,
-                        min_cells_per_sample=10, n_bins=5, formats=('png', 'pdf', 'svg'),
-                        wpsi_tolerance=1e-6):
+                        min_cells_per_sample=10, n_bins=5, formats=('pdf',),
+                        wpsi_tolerance=1e-6, cleanup_existing=True):
     """Export one program's tables and figures into the existing layer3 directory.
 
     Reuse Layer 0 core membership and Layer 2 selected cell type. Recompute only
@@ -139,6 +172,8 @@ def generate_program_report(data, config, gene_tables, association_summary,
     Boundary deviations <= wpsi_tolerance are retained, not clipped. Material
     core-gene or used cached-median outliers stop the report after exporting
     diagnostic files. Noncore cell-level outliers are recorded separately.
+    Figures default to PDF only. After successful figure generation, remove
+    this program's known redundant PNG/SVG files with a PDF counterpart.
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
@@ -497,7 +532,11 @@ def generate_program_report(data, config, gene_tables, association_summary,
                 fig.tight_layout()
                 save(fig, 'G_enrichment_length_overlap')
 
+    removed = (cleanup_report_figures(
+        out, program=program, remove_formats=tuple(ext for ext in ('png', 'svg') if ext not in formats))
+        if cleanup_existing and 'pdf' in formats else [])
     summary = dict(program=program, celltype=celltype, group_a=a, group_b=b,
+                   figure_formats=list(formats), removed_figure_files=removed,
                    wpsi_range_audit=range_audit,
                    association=association_summary.loc[program].to_dict(),
                    population_direction=population_direction.loc[program].to_dict(),
@@ -564,8 +603,9 @@ def generate_program_report(data, config, gene_tables, association_summary,
         关键基因为预先指定列表，不按显著性挑选；缺失于核心集的基因记录在 summary JSON。
         本补充分析不重新查询富集、不覆盖 Layer0、不覆盖既有 Layer3 文件。
         同名 {prefix}_ 文件在重复运行时会更新。
+        本次图像格式：{', '.join(formats)}；已清理 {len(removed)} 个同名 PNG/SVG 副本，保留 PDF、统计表和其他分析图。
         '''), encoding='utf-8')
     return dict(genes=genes, key_genes=selected, sample_wpsi=sample_table,
                 usage=usage_table, usage_bins=bin_table, correlations=corr_table,
                 enrichment_overlap=overlap_table,
-                summary=summary, figures=figures, output_dir=out)
+                summary=summary, figures=figures, removed_figure_files=removed, output_dir=out)
