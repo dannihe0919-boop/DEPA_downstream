@@ -161,6 +161,34 @@ p02_report = generate_program_report(
 必须确认上游 wPSI 越大是否表示远端偏好，且未检出值没有被填成 0。
 样本检验比较独立样本均值，两组至少各两个合格样本；sample ID 不能自动视为独立患者。
 
+#### 将图 G 改为偏短／偏长基因集的富集气泡图
+
+在已有 `p02_report` 后加一个单元即可，无须重跑 A–F：
+
+```python
+from depa_downstream.program_report import run_directional_enrichment
+directional = run_directional_enrichment(
+    p02_report['genes'], gene_tables, CONFIG,
+    program='P02', output_dir=OUTPUT_ROOT / 'layer3', top_n=10,
+)
+display(directional['status'])
+print(directional['figure'])
+```
+
+该函数会联网：直接沿用图 C 的 `report_length_preference`，对偏短组和偏长组
+分别进行 Enrichr 查询。两组背景均为完整 `gene_tables` 的 PAC 基因全集中可映射的
+symbol（不另按 wPSI 可靠性过滤）。未映射 ENSG 不参与查询，实际发送数量和基因表另存。
+少于 `enrichr_min_genes`（默认 3）时跳过；失败记录在 `status` 和 summary 中，
+不会退回全基因组背景，也不能解读为无显著富集。
+
+输出 `<program>_G_directional_enrichment_bubble.pdf`，只保存 PDF；两列分别为
+shorter / longer，气泡大小为 −log10(padj)，颜色为 combined score。
+取每组前 `top_n` 个 padj<0.05 通路的并集；另一组若同样显著也展示，长名称换行保留。
+Enrichr padj 分别对应各查询、各数据库；图中空白不表示两组富集强度存在显著差异。
+同目录另存两组基因列表、完整富集 CSV、背景表、实际展示的 term 表及运行状态。
+旧 G 命中数量图与原 Layer1 富集结果保留，便于追溯。
+方向分组依赖细胞级统计，因此新富集图应作为探索性结果，不能替代患者层面验证。
+
 wPSI 范围检查默认允许 `1e-6` 以内的边界浮点偏差，保留原值，不裁剪或缩放。
 报告先写入 `<program>_wpsi_range_summary.json`、`<program>_wpsi_range_by_gene.csv`
 和 `<program>_wpsi_range_examples.csv`（最多 1000 条越界示例）。非核心基因的细胞级
@@ -175,5 +203,5 @@ removed = cleanup_report_figures(OUTPUT_ROOT / 'layer3', program='P02')
 print('删除冗余图文件数：', len(removed))
 ```
 
-清理仅匹配本模块 A–G 的固定文件名，且需存在对应 PDF。保留其他 program、
+清理仅匹配本模块 A–G（含新版 G 气泡图）的固定文件名，且需存在对应 PDF。保留其他 program、
 其他分析图、CSV、JSON、图注与没有 PDF 副本的图片。

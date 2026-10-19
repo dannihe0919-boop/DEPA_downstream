@@ -1,7 +1,8 @@
 """Reusable per-program report supplement. Run from a Notebook after Layer 3.
 
-No network queries; no changes to the shared Layer 0 tables. All wPSI values,
-including 0 and 1, are retained. NaN is never replaced by zero.
+generate_program_report is offline; run_directional_enrichment optionally queries
+Enrichr for the two length-change groups. Neither changes shared Layer 0 tables.
+All wPSI values, including 0 and 1, are retained. NaN is never replaced by zero.
 """
 from __future__ import annotations
 
@@ -13,11 +14,16 @@ from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
+import requests
 from scipy.stats import mannwhitneyu, spearmanr
 from statsmodels.stats.multitest import multipletests
 
 from depa_downstream.layer2_association import resolve_disease_contrast
 from depa_downstream.layer3_direction import annotate_within_celltype
+from depa_downstream.layer0_identity import pac_universe
+from depa_downstream.layer1_enrichment import (
+    BackgroundEnrichrClient, DEFAULT_ENRICHR_DATABASES, ENRICHMENT_COLUMNS, _symbols,
+)
 
 DEFAULT_KEY_GENES = {'P02': ['CENPM', 'NAP1L1', 'TPX2', 'MPC1', 'SOX4', 'STMN1',
                  'PTP4A2', 'PCLAF', 'HNRNPA1', 'HNRNPA0', 'CACYBP', 'PSIP1']}
@@ -44,7 +50,7 @@ def cleanup_report_figures(output_dir, *, program='P02', remove_formats=('png', 
         raise ValueError('Only redundant png/svg formats may be removed')
     out, prefix = Path(output_dir), quote(program, safe='')
     removed = []
-    for name in REPORT_FIGURES:
+    for name in (*REPORT_FIGURES, 'G_directional_enrichment_bubble'):
         pdf = out / f'{prefix}_{name}.pdf'
         if not pdf.is_file():
             continue
@@ -609,3 +615,184 @@ def generate_program_report(data, config, gene_tables, association_summary,
                 usage=usage_table, usage_bins=bin_table, correlations=corr_table,
                 enrichment_overlap=overlap_table,
                 summary=summary, figures=figures, removed_figure_files=removed, output_dir=out)
+
+
+def _plot_directional_enrichment(results, statuses, *, program, alpha, top_n):
+    """Select top terms per group, retaining significant cross-group matches."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    groups = ('shorter', 'longer')
+    significant = {}
+    keys = []
+    for group in groups:
+        table = results[group]
+        table = table.loc[pd.to_numeric(table.padj, errors='coerce').lt(alpha)].copy()
+        table['padj'] = pd.to_numeric(table.padj)
+        table = table.sort_values(['padj', 'database', 'term'], kind='stable')
+        table = table.drop_duplicates(['database', 'term'])
+        significant[group] = table
+        for row in table.head(top_n).itertuples():
+            key = (row.database, row.term)
+            if key not in keys:
+                keys.append(key)
+    displayed = []
+    for group in groups:
+        for row in significant[group].to_dict('records'):
+            if (row['database'], row['term']) in keys:
+                displayed.append(dict(group=group, **row))
+    display_table = pd.DataFrame(displayed, columns=['group', *ENRICHMENT_COLUMNS])
+
+    labels = [textwrap.fill(f'{term} [{database}]', 65) for database, term in keys]
+    # Wrapped lines get their own space instead of truncating long GO/Reactome names.
+    heights = [max(1., .62 * (label.count('\n') + 1)) for label in labels]
+    y = np.cumsum(heights) - np.asarray(heights) / 2 if keys else np.array([])
+    figure_height = max(4.8, 2.5 + .40 * sum(heights))
+    fig, ax = plt.subplots(figsize=(12.5, figure_height))
+    fig.subplots_adjust(left=.53, right=.78, bottom=1.15 / figure_height, top=1 - .8 / figure_height)
+    ax.set_xlim(-.55, 1.55)
+    ax.set_xticks([0, 1], [f'{program} {group}\n'
+                         f'ΔwPSI {"<" if group == "shorter" else ">"} 0; n={statuses[group]["n_query_symbols"]}' +
+                         (f'\n{statuses[group]["status"]}' if statuses[group]['status'] not in ('ok', 'empty') else '')
+                         for group in groups], fontsize=9)
+    ax.set_title(f'{program}: enrichment of shorter / longer gene sets\npadj < {alpha:g}', fontsize=12)
+    ax.spines[['top', 'right']].set_visible(False)
+    if not keys:
+        ax.set_yticks([])
+        ax.text(.5, .55, 'No significant terms available', ha='center', transform=ax.transAxes)
+        ax.text(.5, .32, '\n'.join(f'{g}: {statuses[g]["status"]}' for g in groups),
+                ha='center', transform=ax.transAxes, fontsize=9)
+    else:
+        raw_scores = pd.to_numeric(display_table.combined_score, errors='coerce').to_numpy()
+        finite = raw_scores[np.isfinite(raw_scores)]
+        vmax = max(float(finite.max()) if finite.size else 1., 1.)
+        scores = np.nan_to_num(raw_scores, nan=0., posinf=vmax, neginf=0.).clip(0, vmax)
+        # Keep original scores/padj in CSV; cap display area to avoid overlapping dots.
+        q = display_table.padj.to_numpy(dtype=float)
+        sizes = 24 + 25 * np.minimum(-np.log10(np.maximum(q, np.finfo(float).tiny)), 12)
+        scatter = ax.scatter([groups.index(g) for g in display_table.group],
+                             [y[keys.index((r.database, r.term))] for r in display_table.itertuples()],
+                             s=sizes, c=scores, cmap='Reds', norm=Normalize(0, vmax),
+                             edgecolors='#555555', linewidths=.65)
+        ax.set_yticks(y, labels, fontsize=9)
+        ax.set_ylim(y[-1] + heights[-1] / 2, 0)
+        legend_q = (.01, .00001)
+        handles = [ax.scatter([], [], s=24 + 25 * -np.log10(v), color='#BBBBBB',
+                              edgecolors='#555555', label=f'padj={v:g}') for v in legend_q]
+        ax.legend(handles=handles, title='Bubble size', bbox_to_anchor=(1.05, 1),
+                  loc='upper left', fontsize=9, title_fontsize=9)
+        cax = fig.add_axes([.82, .34, .018, .28])
+        fig.colorbar(scatter, cax=cax, label='Combined score')
+    fig.text(.53, .015,
+             'Same PAC-universe background; n = mapped query symbols.\n'
+             'Size = -log10(padj), capped at 12; nonfinite scores shown at color limits.\n'
+             'A blank is not evidence of a significant difference between groups.', fontsize=8)
+    return fig, display_table
+
+
+def run_directional_enrichment(report_genes, gene_tables, config, *, program='P02',
+                               output_dir=None, top_n=10, alpha=.05,
+                               session=None, on_error='record'):
+    """Query shorter/longer core genes separately and export a PDF bubble plot.
+
+    Call with generate_program_report(...)["genes"] and FULL Layer 0 gene_tables.
+    Uses report_length_preference from figure C, not concordance/supports labels.
+    Both groups use the same mapped PAC universe, never a genome fallback.
+    Enrichr padj is specific to each query/database; the figure does not test
+    between-group enrichment differences. No new wPSI tests are performed.
+    Existing A-G report figures are preserved; only this function queries a server.
+    """
+    import matplotlib.pyplot as plt
+
+    if not isinstance(program, str) or not program.strip() or program not in gene_tables:
+        raise ValueError('program must identify a program in gene_tables')
+    if on_error not in ('raise', 'record'):
+        raise ValueError('on_error must be raise or record')
+    if not isinstance(top_n, int) or top_n < 1 or not 0 < alpha <= 1:
+        raise ValueError('top_n must be positive and alpha must lie in (0,1]')
+    required = {'gene_id', 'symbol', 'is_core', 'report_length_preference'}
+    if required - set(report_genes):
+        raise ValueError(f'Missing report columns: {sorted(required - set(report_genes))}')
+    genes = report_genes.copy(deep=True)
+    source = gene_tables[program].set_index('gene_id')
+    if not genes.gene_id.is_unique or not genes.gene_id.isin(source.index).all():
+        raise ValueError('Report gene IDs must be unique and belong to the requested program')
+    if not genes.report_length_preference.isin(COLORS).all():
+        raise ValueError('Unknown report_length_preference; use the current program report')
+    if not genes.symbol.fillna('').eq(genes.gene_id.map(source.symbol).fillna('')).all():
+        raise ValueError('Report symbols differ from Layer 0; regenerate the program report')
+    genes = genes.loc[genes.is_core.fillna(False)].copy()
+    if not genes.gene_id.map(source.is_core).fillna(False).all():
+        raise ValueError('Report core membership differs from Layer 0')
+    if set(genes.gene_id) != set(source.index[source.is_core]):
+        raise ValueError('Pass all core rows from the program report, not a selected key-gene subset')
+    universe = pac_universe(gene_tables)
+    background = _symbols(universe.symbol)
+    databases = config.get('enrichr_databases', DEFAULT_ENRICHR_DATABASES)
+    minimum = int(config.get('enrichr_min_genes', 3))
+    if not isinstance(databases, (list, tuple)) or not databases or minimum < 1:
+        raise ValueError('Enrichment requires a nonempty database list and a positive min_genes')
+    groups = ('shorter', 'longer')
+    lists = {g: genes.loc[genes.report_length_preference.eq(g)].copy() for g in groups}
+    queries = {g: _symbols(t.symbol) for g, t in lists.items()}
+    if set(queries['shorter']) & set(queries['longer']):
+        raise ValueError('A mapped symbol belongs to both length groups; resolve gene mapping first')
+    out = Path(output_dir) if output_dir is not None else Path(config['output_root']) / 'layer3'
+    out.mkdir(parents=True, exist_ok=True)
+    prefix = quote(program, safe='')
+    results, statuses = {}, {}
+    with BackgroundEnrichrClient(background, session=session, timeout=config.get('enrichr_timeout', 30)) as client:
+        for group in groups:
+            table = pd.DataFrame(columns=ENRICHMENT_COLUMNS)
+            status = dict(program=program, group=group, n_selected_genes=len(lists[group]),
+                          n_query_symbols=len(queries[group]),
+                          n_unmapped_query_genes=int(lists[group].symbol.map(lambda s: not _symbols([s])).sum()),
+                          n_pac_universe_genes=len(universe), n_background_symbols=len(background),
+                          background_scope='pac_universe')
+            if not background:
+                status.update(status='failed', error='PAC universe has no mapped gene symbols')
+                if on_error == 'raise':
+                    raise ValueError(status['error'])
+            elif len(queries[group]) < minimum:
+                status['status'] = 'skipped_insufficient_genes'
+            else:
+                try:
+                    table = client.query(queries[group], list(databases), f'{program}_{group}')
+                    status['status'] = 'ok' if len(table) else 'empty'
+                except (requests.RequestException, ValueError, KeyError, TypeError) as error:
+                    if on_error == 'raise':
+                        raise
+                    status.update(status='failed', error=f'{type(error).__name__}: {error}')
+                    warnings.warn(f'{program} {group} enrichment failed: {error}', stacklevel=2)
+            table.attrs.update(status)
+            results[group], statuses[group] = table, status
+            lists[group]['sent_to_enrichr'] = lists[group].symbol.isin(queries[group])
+            lists[group].to_csv(out / f'{prefix}_{group}_gene_list.csv', index=False, encoding='utf-8-sig')
+            table.to_csv(out / f'{prefix}_{group}_enrichment.csv', index=False, encoding='utf-8-sig')
+    universe.to_csv(out / f'{prefix}_directional_enrichment_background.csv', index=False, encoding='utf-8-sig')
+    fig, displayed = _plot_directional_enrichment(results, statuses, program=program, alpha=alpha, top_n=top_n)
+    pdf = out / f'{prefix}_G_directional_enrichment_bubble.pdf'
+    fig.savefig(pdf, bbox_inches='tight')
+    plt.close(fig)
+    displayed.to_csv(out / f'{prefix}_directional_enrichment_displayed_terms.csv', index=False, encoding='utf-8-sig')
+    metadata = dict(program=program, groups=statuses, databases=list(databases), alpha=alpha, top_n=top_n,
+                    grouping='Core genes; report_length_preference from within-celltype mean wPSI B-A',
+                    inference='Exploratory cell-level gene selection; not a between-group enrichment test',
+                    padj_scope='Enrichr adjusted p-value, separately per query and database',
+                    symbol_mapping='Unmapped ENSG identifiers omitted from queries and background',
+                    source_context={c: genes[c].dropna().unique().tolist() for c in
+                                    ('within_celltype', 'within_celltype_group_a', 'within_celltype_group_b') if c in genes})
+    (out / f'{prefix}_directional_enrichment_summary.json').write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False, allow_nan=False) + '\n', encoding='utf-8')
+    (out / f'{prefix}_directional_enrichment_notes.md').write_text(
+        '偏短/偏长组直接沿用图C的 report_length_preference，差值为疾病组B−对照组A。\n'
+        '两组分别重新富集，背景均为完整PAC基因全集中可映射的symbol；不是仅核心基因或可靠基因。\n'
+        'CSV保留未映射基因及发送状态；显著性为各基因组、各数据库的Enrichr校正值。\n'
+        '气泡大小为−log10(padj)，显示上限12；颜色为combined score，非有限值仅在绘图时置于色阶边界。\n'
+        '每组取前top_n个显著term的并集；另一组若同样显著也展示。长名称换行且保留数据库。\n'
+        '空白仅表示该组未有达到阈值的返回结果；不能据此认定两组富集强度存在显著差异。\n'
+        '失败或基因数不足记录在summary，不能解释为没有生物学富集。\n'
+        '分组依赖细胞级统计，通路结果属于探索性线索，不能代替独立患者层面的验证。\n'
+        '本图与旧G的命中数量图是两种分析；旧图和原Layer1结果保留，不互相覆盖。\n', encoding='utf-8')
+    return dict(enrichment=results, gene_lists=lists, status=pd.DataFrame(statuses.values()),
+                displayed_terms=displayed, figure=str(pdf), output_dir=out)
